@@ -12,6 +12,7 @@ library(RPostgres)
 library(DBI)
 library(readxl)
 library(shinyjs)
+library(DT)
 
 # Load environment variables
 if (file.exists(".env")) {
@@ -58,6 +59,99 @@ query_params <- list()
 parsed_response <- parse_response(get_response(url, query_params, api_key))
 schema_details <- parsed_response$fieldDefinitions
 
+# Function to match column names and types
+match_column_names <- function(df) {
+  expected_names <- schema_details %>%
+    filter(!type == "custom_entity_link") %>%
+    select(displayName, type)
+  
+  actualnames <- data.frame(
+    displayName = colnames(df),
+    actual_type = sapply(df, class),
+    row.names = NULL
+  )
+  
+  actualnames <- actualnames %>%
+    filter(displayName %in% expected_names$displayName)
+  
+  actualnames$actual_type <- gsub("character", "text", actualnames$actual_type)
+  
+  df_to_return <- plyr::join(expected_names, actualnames)
+  colnames(df_to_return) <- c("Column name", "Expected data type", "Uploaded data type")
+  
+  mismatched <- df_to_return %>%
+    filter(`Expected data type` != `Uploaded data type`)
+  
+  if (nrow(mismatched) == 0) {
+    return(TRUE)
+  } else {
+    return(mismatched)
+  }
+}
+
+# Function to check custom entity links
+check_custom_entity_links <- function(df, benchcon) {
+  # Initialize result list
+  unmatched <- list()
+  
+  # Strain check
+  strain_query <- paste0("'", paste(df$Strain, collapse = "','"), "'")
+  sql_query <- sprintf("SELECT \"file_registry_id$\" FROM strain WHERE \"file_registry_id$\" IN (%s)", strain_query)
+  strain_key <- dbGetQuery(benchcon, sql_query)$`file_registry_id$`
+  unmatched$strain <- setdiff(df$Strain, strain_key)
+  
+  # Run ID check
+  run_query <- paste0("'", paste(df$`Run ID`, collapse = "','"), "'")
+  sql_query_run <- sprintf("SELECT \"name$\" FROM usp_run_id$raw WHERE \"name$\" IN (%s)", run_query)
+  run_id_key <- dbGetQuery(benchcon, sql_query_run)$`name$`
+  unmatched$run_id <- setdiff(df$`Run ID`, run_id_key)
+  
+  # Experiment ID check
+  exp_query <- paste0("'", paste(df$`Experiment ID`, collapse = "','"), "'")
+  sql_query_exp <- sprintf("SELECT \"name$\" FROM usp_experiment_id WHERE \"name$\" IN (%s)", exp_query)
+  exp_id_key <- dbGetQuery(benchcon, sql_query_exp)$`name$`
+  unmatched$exp_id <- setdiff(df$`Experiment ID`, exp_id_key)
+  
+  return(unmatched)
+}
+
+# Function to remove unmatched rows
+remove_unmatched_rows <- function(df, unmatched) {
+  if (length(unmatched$strain) > 0) {
+    df <- df[!(df$Strain %in% unmatched$strain), ]
+  }
+  if (length(unmatched$run_id) > 0) {
+    df <- df[!(df$`Run ID` %in% unmatched$run_id), ]
+  }
+  if (length(unmatched$exp_id) > 0) {
+    df <- df[!(df$`Experiment ID` %in% unmatched$exp_id), ]
+  }
+  return(df)
+}
+
+# Function to send request
+send_request <- function(endpoint_url, secret_key, json_payload) {
+  response <- POST(
+    url = endpoint_url,
+    add_headers(.headers = c(
+      "accept" = "application/json"
+    )),
+    authenticate(secret_key, ""),
+    body = json_payload
+  )
+  response
+}
+
+# Function to get task status
+get_task_status <- function(taskid, secret_key) {
+  url <- "https://helaina.benchling.com/api/v2/tasks"
+  response <- get_response(url = paste0(url, "/", taskid),
+                           query_params = list(),
+                           secret_key = secret_key)
+  result <- parse_response(response)$status
+  return(result)
+}
+
 # Shiny UI
 ui <- fluidPage(
   useShinyjs(),
@@ -65,59 +159,146 @@ ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       fileInput("file", "Choose Excel File", accept = c(".xlsx")),
-      actionButton("upload", "Upload and Process"),
-      actionButton("check_columns", "Check Columns")
+      actionButton("upload", "Upload and Process", style = "display:none;"),
+      uiOutput("notebook_select"),
+      uiOutput("notebook_link")
     ),
     mainPanel(
-      tableOutput("contents"),
+      wellPanel(
+        DTOutput("status_table")
+      ),
+      wellPanel(
+        DTOutput("contents")
+      ),
       verbatimTextOutput("response"),
-      uiOutput("modal_ui")
+      textOutput("task_status")
     )
   )
 )
 
 # Shiny Server
 server <- function(input, output, session) {
+  available_entries <- NULL
+  task_id <- NULL
+  
   observeEvent(input$file, {
     req(input$file)
     df <- read_excel(input$file$datapath)
-    output$contents <- renderTable({
-      df
+    
+    # Automatically check columns when file is uploaded
+    user_columns <- colnames(df)
+    expected_columns <- schema_details$displayName
+    missing_columns <- setdiff(expected_columns, user_columns)
+    
+    status_data <- data.frame(
+      Step = character(),
+      Status = character(),
+      Details = character(),
+      stringsAsFactors = FALSE
+    )
+    
+    if (length(missing_columns) == 0) {
+      status_data <- rbind(status_data, data.frame(Step = "1. Column names check", Status = "Passed", Details = "All column names match the expected schema."))
+      type_check <- match_column_names(df)
+      
+      if (isTRUE(type_check)) {
+        status_data <- rbind(status_data, data.frame(Step = "2. Data types check", Status = "Passed", Details = "All data types match the expected schema."))
+        custom_entity_check <- check_custom_entity_links(df, benchcon)
+        
+        if (all(sapply(custom_entity_check, length) == 0)) {
+          status_data <- rbind(status_data, data.frame(Step = "3. Custom entity links check", Status = "Passed", Details = "All custom entity links matched successfully."))
+          shinyjs::show("upload")
+          output$contents <- renderDT({
+            datatable(df)
+          })
+        } else {
+          if (length(custom_entity_check$strain) > 0) {
+            status_data <- rbind(status_data, data.frame(Step = "3. Custom entity links check", Status = "Failed", Details = paste("Unmatched Strains:", paste(custom_entity_check$strain, collapse = ", "))))
+          }
+          if (length(custom_entity_check$run_id) > 0) {
+            status_data <- rbind(status_data, data.frame(Step = "3. Custom entity links check", Status = "Failed", Details = paste("Unmatched Run IDs:", paste(custom_entity_check$run_id, collapse = ", "))))
+          }
+          if (length(custom_entity_check$exp_id) > 0) {
+            status_data <- rbind(status_data, data.frame(Step = "3. Custom entity links check", Status = "Failed", Details = paste("Unmatched Experiment IDs:", paste(custom_entity_check$exp_id, collapse = ", "))))
+          }
+          
+          df_filtered <- remove_unmatched_rows(df, custom_entity_check)
+          
+          showModal(modalDialog(
+            title = "Unmatched Custom Entity Links",
+            "Unmatched custom entity links were found. Rows containing those links have been removed. Please review the data that passed QC before proceeding or fix the links and upload a new file.",
+            footer = modalButton("OK")
+          ))
+          
+          output$contents <- renderDT({
+            datatable(df_filtered)
+          })
+          
+          status_data <- rbind(status_data, data.frame(Step = "Warning", Status = "Rows Removed", Details = "Unmatched custom entity links have been removed. Please review the filtered data and either reupload an updated file or proceed with the table."))
+          
+          shinyjs::show("upload")
+        }
+      } else {
+        type_check_df <- as.data.frame(type_check)
+        type_check_details <- paste(
+          apply(type_check_df, 1, function(row) {
+            paste("Column name:", row["Column name"], "- Expected:", row["Expected data type"], "- Uploaded:", row["Uploaded data type"])
+          }),
+          collapse = "; "
+        )
+        status_data <- rbind(status_data, data.frame(Step = "2. Data types check", Status = "Failed", Details = type_check_details))
+        shinyjs::hide("upload")
+        output$contents <- renderDT({
+          NULL
+        })
+      }
+    } else {
+      missing_columns_text <- paste(missing_columns, collapse = ", ")
+      expected_columns_text <- paste(expected_columns, collapse = ", ")
+      status_data <- rbind(status_data, data.frame(Step = "1. Column names check", Status = "Failed", Details = paste("Missing columns:", missing_columns_text, ". Expected columns:", expected_columns_text)))
+      shinyjs::hide("upload")
+      output$contents <- renderDT({
+        NULL
+      })
+    }
+    
+    output$status_table <- renderDT({
+      datatable(status_data, options = list(dom = 't', pageLength = nrow(status_data)))
     })
     
-    observeEvent(input$check_columns, {
-      user_columns <- colnames(df)
-      expected_columns <- schema_details$displayName
-      missing_columns <- setdiff(expected_columns, user_columns)
-      column_types <- schema_details$type
-      expected_types <- schema_details %>% select(displayName, type)
-      
-      if (length(missing_columns) == 0) {
-        showModal(modalDialog(
-          title = "Column Check",
-          "All columns match the expected schema!",
-          footer = modalButton("OK")
+    # Fetch available notebook entries
+    response <- get_response(url = "https://helaina.benchling.com/api/v2/entries",
+                             query_params = list(
+                               projectId = "src_TidCEmsN",  # Adjust with the correct project ID
+                               pageSize = 50
+                             ),
+                             secret_key = api_key
+    )
+    
+    available_entries <- parse_response(response)$entries[, c("id", "name", "apiURL")]
+    
+    output$notebook_select <- renderUI({
+      selectInput("notebook", "Select Notebook", choices = setNames(available_entries$id, available_entries$name), selected = NULL)
+    })
+  })
+  
+  observeEvent(input$notebook, {
+    selected_entry <- available_entries[available_entries$id == input$notebook, ]
+    
+    output$notebook_link <- renderUI({
+      if (nrow(selected_entry) > 0) {
+        HTML(paste(
+          "Notebook URL: <a href='", selected_entry$apiURL, "' target='_blank'>", selected_entry$apiURL, "</a>"
         ))
       } else {
-        showModal(modalDialog(
-          title = "Column Check",
-          "The following columns do not match:",
-          renderText({
-            paste(missing_columns, collapse = ", ")
-          }),
-          renderText({
-            paste("Expected data types for each column: ", 
-                  paste(expected_types$displayName, ": ", expected_types$type, collapse = ", "), 
-                  collapse = "\n")
-          }),
-          footer = modalButton("OK")
-        ))
+        "No notebook selected"
       }
     })
   })
   
   observeEvent(input$upload, {
     req(input$file)
+    req(input$notebook)
     df <- read_excel(input$file$datapath)
     
     strain_query <- paste0("'", paste(df$Strain, collapse = "','"), "'")
@@ -142,68 +323,41 @@ server <- function(input, output, session) {
       select(-Strain, -`Run ID`, -`Experiment ID`)
     colnames(df) <- c("Value 1", "Value 2", "Strain", "Run ID", "Experiment ID")
     
-    output$contents <- renderTable({
-      df
+    output$contents <- renderDT({
+      datatable(df)
     })
     
-    projectID <- "src_TidCEmsN"
     schemaID <- "assaysch_bSdwxZvH"
     endpointURL <- "https://helaina.benchling.com/api/v2/assay-results:bulk-create"
     
-    response <- get_response(url = "https://helaina.benchling.com/api/v2/entries",
-                             query_params = list(
-                               projectId = projectID,
-                               pageSize = 50
-                             ),
-                             secret_key = api_key
-    )
-    
-    available_entries <- parse_response(response)$entries[, c("id", "name", "apiURL")]
-    
-    response <- get_response(url = "https://helaina.benchling.com/api/v2/entries/etr_uGxP7kVB",
-                             query_params = list(),
-                             secret_key = api_key
-    )
-    
-    parsedtableresponse <- parse_response(response)
-    tableID <- parsedtableresponse$entry$days$notes[[1]]$apiId[parsedtableresponse$entry$days$notes[[1]]$type == "results_table"]
-    
-    create_payload <- function(df, schema_id, project_id, table_id) {
-      assay_results <- lapply(1:nrow(df), function(i) {
-        list(
-          fields = list(
-            "strain" = list(value = df$Strain[i]),
-            "run_id" = list(value = df$`Run ID`[i]),
-            "experiment_id" = list(value = df$`Experiment ID`[i]),
-            "value_1" = list(value = (df$`Value 1`[i])),
-            "value_2" = list(value = df$`Value 2`[i])
-          ),
-          schemaId = schema_id,
-          projectId = project_id
-        )
-      })
-      list(assayResults = assay_results, tableId = table_id)
-    }
-    
-    payload <- create_payload(df, schemaID, projectID, tableID)
+    payload <- create_payload(df, schemaID, input$notebook, tableID)
     json_payload <- toJSON(payload, auto_unbox = TRUE, pretty = TRUE)
-    
-    send_request <- function(endpoint_url, secret_key, json_payload) {
-      response <- POST(
-        url = endpoint_url,
-        add_headers(.headers = c(
-          "accept" = "application/json"
-        )),
-        authenticate(secret_key, ""),
-        body = json_payload
-      )
-      response
-    }
     
     response <- send_request(endpoint_url = endpointURL, secret_key = api_key, json_payload)
     
+    task_id <<- parse_response(response)$taskId
+    
     output$response <- renderPrint({
       content(response, as = "text")
+    })
+  })
+  
+  observe({
+    req(task_id)
+    invalidateLater(2000, session)
+    task_status <- get_task_status(task_id, api_key)
+    
+    if (task_status == "SUCCEEDED") {
+      showModal(modalDialog(
+        title = "Data Upload",
+        "The data has been successfully uploaded.",
+        footer = modalButton("OK")
+      ))
+      task_id <<- NULL
+    }
+    
+    output$task_status <- renderText({
+      paste("Task Status:", task_status)
     })
   })
 }

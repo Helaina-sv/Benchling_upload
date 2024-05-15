@@ -11,8 +11,8 @@ library(dotenv)
 library(RPostgres)
 library(DBI)
 library(readxl)
+library(shinyjs)
 
-getwd()
 # Load environment variables
 if (file.exists(".env")) {
   load_dot_env(".env")
@@ -52,23 +52,70 @@ parse_response <- function(response) {
   return(parsed_content)
 }
 
+# Fetch schema details
+url <- "https://helaina.benchling.com/api/v2/assay-result-schemas/assaysch_bSdwxZvH"
+query_params <- list()
+parsed_response <- parse_response(get_response(url, query_params, api_key))
+schema_details <- parsed_response$fieldDefinitions
+
 # Shiny UI
 ui <- fluidPage(
+  useShinyjs(),
   titlePanel("File Upload and API Integration"),
   sidebarLayout(
     sidebarPanel(
       fileInput("file", "Choose Excel File", accept = c(".xlsx")),
-      actionButton("upload", "Upload and Process")
+      actionButton("upload", "Upload and Process"),
+      actionButton("check_columns", "Check Columns")
     ),
     mainPanel(
       tableOutput("contents"),
-      verbatimTextOutput("response")
+      verbatimTextOutput("response"),
+      uiOutput("modal_ui")
     )
   )
 )
 
 # Shiny Server
-server <- function(input, output) {
+server <- function(input, output, session) {
+  observeEvent(input$file, {
+    req(input$file)
+    df <- read_excel(input$file$datapath)
+    output$contents <- renderTable({
+      df
+    })
+    
+    observeEvent(input$check_columns, {
+      user_columns <- colnames(df)
+      expected_columns <- schema_details$displayName
+      missing_columns <- setdiff(expected_columns, user_columns)
+      column_types <- schema_details$type
+      expected_types <- schema_details %>% select(displayName, type)
+      
+      if (length(missing_columns) == 0) {
+        showModal(modalDialog(
+          title = "Column Check",
+          "All columns match the expected schema!",
+          footer = modalButton("OK")
+        ))
+      } else {
+        showModal(modalDialog(
+          title = "Column Check",
+          "The following columns do not match:",
+          renderText({
+            paste(missing_columns, collapse = ", ")
+          }),
+          renderText({
+            paste("Expected data types for each column: ", 
+                  paste(expected_types$displayName, ": ", expected_types$type, collapse = ", "), 
+                  collapse = "\n")
+          }),
+          footer = modalButton("OK")
+        ))
+      }
+    })
+  })
+  
   observeEvent(input$upload, {
     req(input$file)
     df <- read_excel(input$file$datapath)

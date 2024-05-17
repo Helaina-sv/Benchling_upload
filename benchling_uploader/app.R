@@ -14,6 +14,12 @@ library(readxl)
 library(shinyjs)
 library(DT)
 
+
+#all_schemas<- dbGetQuery(benchcon, "SELECT * FROM schema")
+#all_entity<- dbGetQuery(benchcon, "SELECT * FROM entity")
+#all_tables<- dbGetQuery(benchcon, "SELECT * FROM information_schema.tables WHERE table_type = 'BASE TABLE'")
+
+
 # Load environment variables
 if (file.exists(".env")) {
   load_dot_env(".env")
@@ -31,6 +37,11 @@ api_key <- "sk_xRhZUegRsZUH6mUPwcdnRqfxdQYRf"
 
 benchcon <- dbConnect(RPostgres::Postgres(), dbname = db, host = host_db, port = db_port, user = db_user, password = db_password)
 
+all_schemas<- dbGetQuery(benchcon, "SELECT * FROM schema") %>%
+  filter(schema_type == "assay_result")%>%
+  filter(`archived$` == FALSE)
+#all_entries<- dbGetQuery(benchcon, "SELECT * FROM entry")
+#all_strain
 # Define the request function
 get_response <- function(url, query_params, secret_key) {
   response <- GET(url,
@@ -53,35 +64,65 @@ parse_response <- function(response) {
   return(parsed_content)
 }
 
-# Fetch schema details
-url <- "https://helaina.benchling.com/api/v2/assay-result-schemas/assaysch_bSdwxZvH"
-query_params <- list()
-parsed_response <- parse_response(get_response(url, query_params, api_key))
-schema_details <- parsed_response$fieldDefinitions
+
+fetch_schema_details<- function(schema_name){
+  schema_id<- all_schemas %>%
+    filter(name == schema_name)%>%
+    select(id)
+  schema_id<- as.character(schema_id)
+  url<- paste0("https://helaina.benchling.com/api/v2/assay-result-schemas/",schema_id)
+  query_params <- list()
+  parsed_response <- parse_response(get_response(url, query_params, api_key))
+  schema_details <- parsed_response$fieldDefinitions
+  return(schema_details)
+}
+
+
+
 
 # Function to match column names and types
 match_column_names <- function(df) {
+  # Access the reactive dataframe schema_details
+  schema_details <- schema_details()
+  
+  # Filter and select the expected names and types from schema_details
   expected_names <- schema_details %>%
-    filter(!type == "custom_entity_link") %>%
+    filter(!type %in% c("custom_entity_link", "entity_link")) %>%
     select(displayName, type)
   
+  # Create a dataframe of actual names and their types from the provided dataframe
   actualnames <- data.frame(
     displayName = colnames(df),
-    actual_type = sapply(df, class),
+    actual_type = sapply(df, function(x) {
+      if (is.character(x)) {
+        if (all(grepl("^\\d{4}-\\d{2}-\\d{2}$", x))) {
+          return("date")
+        }
+        if (all(grepl("^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$", x))) {
+          return("datetime")
+        }
+        return("text")
+      }
+      if (is.numeric(x) && all(x == as.integer(x))) return("integer")
+      if (is.numeric(x)) return("float")
+      return("unknown")
+    }),
     row.names = NULL
   )
   
+  # Filter actualnames to only include columns present in expected_names
   actualnames <- actualnames %>%
     filter(displayName %in% expected_names$displayName)
   
-  actualnames$actual_type <- gsub("character", "text", actualnames$actual_type)
-  
-  df_to_return <- plyr::join(expected_names, actualnames)
+  # Join expected names and actual names dataframes
+  df_to_return <- plyr::join(expected_names, actualnames, by = "displayName")
   colnames(df_to_return) <- c("Column name", "Expected data type", "Uploaded data type")
   
+  # Find mismatched types
   mismatched <- df_to_return %>%
     filter(`Expected data type` != `Uploaded data type`)
   
+  # Return TRUE if no mismatches, otherwise return the mismatched dataframe
   if (nrow(mismatched) == 0) {
     return(TRUE)
   } else {
@@ -89,84 +130,122 @@ match_column_names <- function(df) {
   }
 }
 
-create_payload <- function(df, schema_id, project_id, table_id) {
+
+
+
+create_json_payload <- function(df, schema_id, project_id, table_id) {
+  schema_details <- schema_details()
+  
+  # Extract the display names and internal names from the schema_details dataframe
+  display_names <- schema_details$displayName
+  internal_names <- schema_details$name
+  
+  # Function to create a single record payload
+  create_record_payload <- function(row, display_names, internal_names) {
+    fields <- setNames(lapply(seq_along(display_names), function(i) {
+      list(value = row[[display_names[i]]])
+    }), internal_names)
+    
+    list(fields = fields, schemaId = schema_id, projectId = project_id)
+  }
+  
+  # Create the list of assay results
   assay_results <- lapply(1:nrow(df), function(i) {
-    list(
-      fields = list(
-        "strain" = list(value = df$Strain[i]),
-        "run_id" = list(value = df$`Run ID`[i]),
-        "experiment_id" = list(value = df$`Experiment ID`[i]),
-        "value_1" = list(value = (df$`Value 1`[i])),
-        "value_2" = list(value = df$`Value 2`[i])
-      ),
-      schemaId = schema_id,
-      projectId = project_id
-    )
+    create_record_payload(df[i, ], display_names, internal_names)
   })
-  list(assayResults = assay_results, tableId = table_id)
+  
+ payload<- list(assayResults = assay_results, tableId = table_id)
+ toJSON(payload, auto_unbox = TRUE, pretty = TRUE)
 }
-
-
 
 
 # Function to check custom entity links
 check_custom_entity_links <- function(df, benchcon) {
-  # Initialize result list
-  unmatched <- list()
   
-  # Strain check
-  strain_query <- paste0("'", paste(df$Strain, collapse = "','"), "'")
-  sql_query <- sprintf("SELECT \"file_registry_id$\" FROM strain WHERE \"file_registry_id$\" IN (%s)", strain_query)
-  strain_key <- dbGetQuery(benchcon, sql_query)$`file_registry_id$`
-  unmatched$strain <- setdiff(df$Strain, strain_key)
+  schema_details<- schema_details()
   
-  # Run ID check
-  run_query <- paste0("'", paste(df$`Run ID`, collapse = "','"), "'")
-  sql_query_run <- sprintf("SELECT \"name$\" FROM usp_run_id$raw WHERE \"name$\" IN (%s)", run_query)
-  run_id_key <- dbGetQuery(benchcon, sql_query_run)$`name$`
-  unmatched$run_id <- setdiff(df$`Run ID`, run_id_key)
+  entity_links<- schema_details %>%
+    filter(type %in% c("custom_entity_link", "entity_link")) %>%
+    select(name,displayName)
   
-  # Experiment ID check
-  exp_query <- paste0("'", paste(df$`Experiment ID`, collapse = "','"), "'")
-  sql_query_exp <- sprintf("SELECT \"name$\" FROM usp_experiment_id WHERE \"name$\" IN (%s)", exp_query)
-  exp_id_key <- dbGetQuery(benchcon, sql_query_exp)$`name$`
-  unmatched$exp_id <- setdiff(df$`Experiment ID`, exp_id_key)
+  entity_links_name<- as.vector(entity_links$name)
+  entity_links_displayname<- as.vector(entity_links$displayName)
+  
+  entity_data<- df %>%
+    select(all_of(entity_links_displayname))
+  
+  entity_data<- sapply(entity_data, unique)
+  
+  entity_match<- function(vec){
+    query <- paste0("'", paste(vec, collapse = "','"), "'")
+    
+    sql_query <- sprintf("SELECT \"file_registry_id$\" FROM strain WHERE \"file_registry_id$\" IN (%s)", query)
+    check1<- dbGetQuery(benchcon, sql_query)$`file_registry_id$`
+    
+    sql_query <- sprintf("SELECT name FROM entity WHERE name IN (%s)", query)
+    check2<- dbGetQuery(benchcon, sql_query)$name
+    setdiff(vec, c(check1, check2))
+    
+  }
+  
+  unmatched <- lapply(entity_data, entity_match)
   
   return(unmatched)
 }
 
 # Function to convert custom entity links to internal IDs
-convert_custom_entity_links <- function(df) {
-  # Strain conversion
-  strain_query <- paste0("'", paste(df$Strain, collapse = "','"), "'")
-  sql_query <- sprintf("SELECT id, \"file_registry_id$\" FROM strain WHERE \"file_registry_id$\" IN (%s)", strain_query)
-  strain_key <- dbGetQuery(benchcon, sql_query)
-  colnames(strain_key) <- c("strain", "Strain")
+
+convert_custom_entity_links <- function(df, benchcon) {
+  # Access the reactive dataframe schema_details
+  schema_details <- schema_details()
   
-  # Run ID conversion
-  run_query <- paste0("'", paste(df$`Run ID`, collapse = "','"), "'")
-  sql_query_run <- sprintf("SELECT id, \"name$\" FROM usp_run_id$raw WHERE \"name$\" IN (%s)", run_query)
-  run_id_key <- dbGetQuery(benchcon, sql_query_run)
-  colnames(run_id_key) <- c("run_id", "Run ID")
+  # Identify custom entity links and entity links
+  entity_links <- schema_details %>%
+    filter(type %in% c("custom_entity_link", "entity_link")) %>%
+    select(name, displayName)
   
-  # Experiment ID conversion
-  exp_query <- paste0("'", paste(df$`Experiment ID`, collapse = "','"), "'")
-  sql_query_exp <- sprintf("SELECT id, \"name$\" FROM usp_experiment_id WHERE \"name$\" IN (%s)", exp_query)
-  exp_id_key <- dbGetQuery(benchcon, sql_query_exp)
-  colnames(exp_id_key) <- c("experiment_id", "Experiment ID")
+  entity_links_displayname <- as.vector(entity_links$displayName)
   
-  # Merge with the original dataframe
-  df <- df %>%
-    left_join(strain_key, by = "Strain") %>%
-    left_join(run_id_key, by = c("Run ID" = "Run ID")) %>%
-    left_join(exp_id_key, by = c("Experiment ID" = "Experiment ID")) %>%
-    select(-Strain, -`Run ID`, -`Experiment ID`)
+  # Extract unique values from the entity columns in the dataframe
+  entity_data <- df %>%
+    select(all_of(entity_links_displayname)) %>%
+    unique() %>%
+    unlist()
   
-  # Rename columns to match expected schema
-  colnames(df) <- c("Value 1", "Value 2", "Strain", "Run ID", "Experiment ID")
+  # Generate the query string
+  query <- paste0("'", paste(entity_data, collapse = "','"), "'")
+  
+  # Fetch data from the strain table
+  sql_query <- sprintf("SELECT id, \"file_registry_id$\" FROM strain WHERE \"file_registry_id$\" IN (%s)", query)
+  check1 <- dbGetQuery(benchcon, sql_query)
+  colnames(check1) <- c("id", "name")
+  
+  # Fetch data from the entity table
+  sql_query <- sprintf("SELECT id, name FROM entity WHERE name IN (%s)", query)
+  check2 <- dbGetQuery(benchcon, sql_query)
+  
+  # Combine the results into a single index dataframe
+  index <- rbind(check1, check2)
+  
+  # Iterate through each column in df that matches displayName in entity_links
+  for (display_name in entity_links_displayname) {
+    # Replace the values in the dataframe with the IDs from the index
+    df[[display_name]] <- sapply(df[[display_name]], function(x) {
+      match_value <- index$id[match(x, index$name)]
+      if (is.na(match_value)) return(NA) else return(match_value)
+    })
+  }
+  
+  # Remove rows where any of the IDs are NA
+  df <- df[complete.cases(df), ]
+  df<- df %>%
+    select(all_of(schema_details$displayName))
   
   return(df)
 }
+
+
+
 create_df_for_payload<- function(df){
   unmatched <- check_custom_entity_links(df, benchcon)
   df_filtered<- remove_unmatched_rows(df, unmatched)
@@ -178,14 +257,11 @@ create_df_for_payload<- function(df){
 
 # Function to remove unmatched rows
 remove_unmatched_rows <- function(df, unmatched) {
-  if (length(unmatched$strain) > 0) {
-    df <- df[!(df$Strain %in% unmatched$strain), ]
-  }
-  if (length(unmatched$run_id) > 0) {
-    df <- df[!(df$`Run ID` %in% unmatched$run_id), ]
-  }
-  if (length(unmatched$exp_id) > 0) {
-    df <- df[!(df$`Experiment ID` %in% unmatched$exp_id), ]
+  for (column_name in names(unmatched)) {
+    unmatched_values <- unmatched[[column_name]]
+    if (length(unmatched_values) > 0) {
+      df <- df[!(df[[column_name]] %in% unmatched_values), ]
+    }
   }
   return(df)
 }

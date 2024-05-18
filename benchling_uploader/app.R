@@ -498,7 +498,9 @@ server <- function(input, output, session) {
         paste("Data cannot be uploaded because required columns are missing. Please ensure that following columns are present:", 
               paste(required_columns, collapse = ", ")),
         easyClose = TRUE,
-        footer = NULL
+        footer = tagList(
+          modalButton("Ok")
+        )
       ))
     }
     
@@ -536,7 +538,7 @@ server <- function(input, output, session) {
     } else {
       missing_columns_text <- paste(missing_columns, collapse = ", ")
       expected_columns_text <- paste(expected_columns, collapse = ", ")
-      status_data <- rbind(status_data, data.frame(Step = "Column names check", Status = "Failed", Details = paste("Missing columns:", missing_columns_text, ". Expected columns:", expected_columns_text)))
+      status_data <- rbind(status_data, data.frame(Step = "Column names check", Status = "Failed, but matching columns can be uploaded", Details = paste("Missing columns:", missing_columns_text, ". Expected columns:", expected_columns_text)))
       shinyjs::hide("upload")
     }
 
@@ -546,7 +548,7 @@ server <- function(input, output, session) {
     } else {
       missing_columns_text <- paste(required_columns, collapse = ", ")
       expected_columns_text <- ""
-      status_data <- rbind(status_data, data.frame(Step = "Required Columns check", Status = "Failed", Details = paste("Required columns are:", required_columns)))
+      status_data <- rbind(status_data, data.frame(Step = "Required Columns check", Status = "Failed. Data cannot be uploaded", Details = paste("Required columns are:", required_columns)))
       shinyjs::hide("upload")
       output$contents <- renderDT({
         datatable(df, options = list(scrollX = TRUE))
@@ -559,17 +561,9 @@ server <- function(input, output, session) {
       if (is.null(missing_values_check)) {
         status_data <- rbind(status_data, data.frame(Step = "Missing values check", Status = "Passed", Details = "No missing values found in the dataset."))
       } else {
-        showModal(modalDialog(
-          title = "Columns Mismatch",
-          paste("There are columns in your uploaded file that are either missing or do not match the expected schema structure. While you can still upload the matching columns data, please ensure that it is the intended and correct file. Following columns are mismatched: ", 
-                paste(missing_columns, collapse = ", ")),
-          easyClose = TRUE,
-          footer = tagList(
-            modalButton("Close")
-          )
-        ))
+
         missing_values_details <- paste(missing_values_check$Column, collapse = ", ")
-        status_data <- rbind(status_data, data.frame(Step = "Missing values check", Status = "Failed", Details = paste("Columns with missing values:", missing_values_details)))
+        status_data <- rbind(status_data, data.frame(Step = "Missing values check", Status = "Failed, but present values can be uploaded", Details = paste("Columns with missing values:", missing_values_details)))
       }
       if (length(matching_columns) == 0 ) {
         showModal(modalDialog(
@@ -608,7 +602,7 @@ server <- function(input, output, session) {
           datatable(df_filtered,options = list(scrollX = TRUE))
         })
         
-        status_data <- rbind(status_data, data.frame(Step = "Custom entity check", Status = "Failed, rows Removed", Details = "Unmatched custom entity links have been removed. Please review the filtered data and either reupload an updated file or proceed with the table."))
+        status_data <- rbind(status_data, data.frame(Step = "Custom entity check", Status = "Failed, rows containing unmatched entites were removed", Details = "Unmatched custom entity links have been removed. Please review the filtered data and either reupload an updated file or proceed with the table."))
         
         shinyjs::show("upload")
       }

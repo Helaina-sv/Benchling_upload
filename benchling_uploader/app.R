@@ -2,9 +2,6 @@ library(shiny)
 library(httr)
 library(jsonlite)
 library(lubridate)
-library(future)
-library(promises)
-library(doParallel)
 library(dplyr)
 library(dbplyr)
 library(dotenv)
@@ -13,11 +10,20 @@ library(DBI)
 library(readxl)
 library(shinyjs)
 library(DT)
+library(plyr)
 
-
-#all_schemas<- dbGetQuery(benchcon, "SELECT * FROM schema")
-#all_entity<- dbGetQuery(benchcon, "SELECT * FROM entity")
-#all_tables<- dbGetQuery(benchcon, "SELECT * FROM information_schema.tables WHERE table_type = 'BASE TABLE'")
+create_dummy_data<- function(){
+  all_schemas<- dbGetQuery(benchcon, "SELECT * FROM schema")
+  all_entity<- dbGetQuery(benchcon, "SELECT * FROM entity")
+  all_dropdown<- dbGetQuery(benchcon, "SELECT * FROM dropdown_option$raw")
+  all_dropdown_menu<- dbGetQuery(benchcon, "SELECT * FROM dropdown")
+  
+  all_entries<- dbGetQuery(benchcon, "SELECT * FROM entry")
+  all_tables<- dbGetQuery(benchcon, "SELECT * FROM information_schema.tables WHERE table_type = 'BASE TABLE'")
+  schema_details<- fetch_schema_details("assaysch_k6vDZiRO")
+  df<- read_excel("~/Downloads/Production Run Sampling.xlsx")
+  df<- remove_empty_columns(df, schema_details)
+  }
 
 
 # Load environment variables
@@ -33,15 +39,22 @@ host_db <- Sys.getenv("HOST_DB")
 db_port <- Sys.getenv("DB_PORT")
 db_user <- Sys.getenv("DB_USER")
 db_password <- Sys.getenv("DB_PASSWORD")
-api_key <- "sk_xRhZUegRsZUH6mUPwcdnRqfxdQYRf"
+api_key <- Sys.getenv("BENCHLINGAPIKEY")
 
 benchcon <- dbConnect(RPostgres::Postgres(), dbname = db, host = host_db, port = db_port, user = db_user, password = db_password)
 
-all_schemas<- dbGetQuery(benchcon, "SELECT * FROM schema") %>%
-  filter(schema_type == "assay_result")%>%
-  filter(`archived$` == FALSE)
-#all_entries<- dbGetQuery(benchcon, "SELECT * FROM entry")
-#all_strain
+
+all_projects<- dbGetQuery(benchcon, "SELECT id,name FROM project$raw") 
+colnames(all_projects)<- c("source_id", "project_name")
+  
+get_entries <- function(projectid) {
+  query <- paste0("SELECT id, name FROM entry$raw WHERE source_id LIKE '", projectid, "'")
+    all_entries <- dbGetQuery(benchcon, query)
+  
+  return(all_entries)
+}
+
+
 # Define the request function
 get_response <- function(url, query_params, secret_key) {
   response <- GET(url,
@@ -64,77 +77,85 @@ parse_response <- function(response) {
   return(parsed_content)
 }
 
-
-fetch_schema_details<- function(schema_name){
-  schema_id<- all_schemas %>%
-    filter(name == schema_name)%>%
-    select(id)
-  schema_id<- as.character(schema_id)
-  url<- paste0("https://helaina.benchling.com/api/v2/assay-result-schemas/",schema_id)
+# Function to fetch schema details based on the schema ID
+fetch_schema_details <- function(schema_id) {
+  url <- paste0("https://helaina.benchling.com/api/v2/assay-result-schemas/", schema_id)
   query_params <- list()
-  parsed_response <- parse_response(get_response(url, query_params, api_key))
+  response <- get_response(url, query_params, api_key)
+  parsed_response <- parse_response(response)
   schema_details <- parsed_response$fieldDefinitions
   return(schema_details)
 }
-
-
-
-
-# Function to match column names and types
-match_column_names <- function(df) {
-  # Access the reactive dataframe schema_details
-  schema_details <- schema_details()
+# if table is > 500 rows
+split_into_chunks <- function(df, chunk_size) {
+  split(df, ceiling(seq_along(1:nrow(df)) / chunk_size))
+}
+#function to check missing values
+check_missing_values <- function(df) {
+  columns_with_missing <- list()
   
-  # Filter and select the expected names and types from schema_details
-  expected_names <- schema_details %>%
-    filter(!type %in% c("custom_entity_link", "entity_link")) %>%
-    select(displayName, type)
+  for (coln in colnames(df)) {
+    if (any(is.na(df[[coln]]))) {
+      columns_with_missing[[length(columns_with_missing) + 1]] <- coln
+    }
+  }
   
-  # Create a dataframe of actual names and their types from the provided dataframe
-  actualnames <- data.frame(
-    displayName = colnames(df),
-    actual_type = sapply(df, function(x) {
-      if (is.character(x)) {
-        if (all(grepl("^\\d{4}-\\d{2}-\\d{2}$", x))) {
-          return("date")
-        }
-        if (all(grepl("^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$", x))) {
-          return("datetime")
-        }
-        return("text")
-      }
-      if (is.numeric(x) && all(x == as.integer(x))) return("integer")
-      if (is.numeric(x)) return("float")
-      return("unknown")
-    }),
-    row.names = NULL
-  )
-  
-  # Filter actualnames to only include columns present in expected_names
-  actualnames <- actualnames %>%
-    filter(displayName %in% expected_names$displayName)
-  
-  # Join expected names and actual names dataframes
-  df_to_return <- plyr::join(expected_names, actualnames, by = "displayName")
-  colnames(df_to_return) <- c("Column name", "Expected data type", "Uploaded data type")
-  
-  # Find mismatched types
-  mismatched <- df_to_return %>%
-    filter(`Expected data type` != `Uploaded data type`)
-  
-  # Return TRUE if no mismatches, otherwise return the mismatched dataframe
-  if (nrow(mismatched) == 0) {
-    return(TRUE)
+  if (length(columns_with_missing) > 0) {
+    return(data.frame(Column = unlist(columns_with_missing), stringsAsFactors = FALSE))
   } else {
-    return(mismatched)
+    return(NULL)
   }
 }
 
 
-
-
-create_json_payload <- function(df, schema_id, project_id, table_id) {
-  schema_details <- schema_details()
+get_table_id<- function(entry_id, schema_id){
+  url<- paste0("https://helaina.benchling.com/api/v2/entries/",entry_id)
+  response <- get_response(url = url,
+                           query_params = list(),
+                           secret_key = api_key
+  )
+  
+  parsedtableresponse<- parse_response(response)
+  notes_df <- parsedtableresponse$entry$days$notes[[1]]
+  
+  # Filter and select the required columns
+  result_df <- notes_df %>%
+    filter(type == "results_table") %>%
+    select(assayResultSchemaId, apiId)%>%
+    filter(assayResultSchemaId %in% schema_id)%>%
+    select(apiId)
+  
+  as.character(result_df$apiId)
+  
+}
+get_schema_id_from_entry<- function(entry_id){
+  url<- paste0("https://helaina.benchling.com/api/v2/entries/",entry_id)
+  response <- get_response(url = url,
+                           query_params = list(),
+                           secret_key = api_key
+  )
+  parsedtableresponse<- parse_response(response)
+  notes_df <- parsedtableresponse$entry$days$notes[[1]]
+  
+  # Filter and select the required columns
+  
+  result_df <- notes_df %>%
+    filter(type == "results_table") 
+  if(nrow(result_df) == 0){
+    return(NULL)
+  }else{
+    result_df<- result_df %>%
+      select(assayResultSchemaId, apiId)
+    
+    as.character(result_df$assayResultSchemaId)
+  }
+  
+  
+}
+create_json_payload <- function(df, schema_id, project_id, table_id, schema_details) {
+  
+  schema_details <- schema_details %>%
+    filter(displayName %in% colnames(df))
   
   # Extract the display names and internal names from the schema_details dataframe
   display_names <- schema_details$displayName
@@ -143,8 +164,16 @@ create_json_payload <- function(df, schema_id, project_id, table_id) {
   # Function to create a single record payload
   create_record_payload <- function(row, display_names, internal_names) {
     fields <- setNames(lapply(seq_along(display_names), function(i) {
-      list(value = row[[display_names[i]]])
+      value <- row[[display_names[i]]]
+      if (!is.na(value)) {
+        return(list(value = value))
+      } else {
+        return(NULL)
+      }
     }), internal_names)
+    
+    # Remove NULL entries (where value was NA)
+    fields <- fields[!sapply(fields, is.null)]
     
     list(fields = fields, schemaId = schema_id, projectId = project_id)
   }
@@ -154,38 +183,73 @@ create_json_payload <- function(df, schema_id, project_id, table_id) {
     create_record_payload(df[i, ], display_names, internal_names)
   })
   
- payload<- list(assayResults = assay_results, tableId = table_id)
- toJSON(payload, auto_unbox = TRUE, pretty = TRUE)
+  # Ensure the payload has the correct structure
+  payload <- list(assayResults = assay_results, tableId = table_id)
+  
+  # Convert to JSON and ensure proper formatting
+  json_payload <- toJSON(payload, auto_unbox = TRUE, pretty = TRUE)
+  return(json_payload)
 }
 
+remove_empty_columns<- function(df, schema_details){
+  required<- schema_details %>% 
+    select(displayName, isRequired) %>%
+    filter(isRequired == FALSE)
+  
+  for (name in required$displayName ){
+    if(all(is.na(df[[name]]))){
+      df<- df %>%
+        select( - all_of(name))
+    }
+  }
+  return(df)
+}
 
+create_dropdown_index<- function(df, schema_details){
+  dropdown_links <- schema_details %>%
+    filter(displayName %in% colnames(df))%>%
+    filter(type %in% c("dropdown")) %>%
+    select(name, displayName, type)
+    query <- paste0("'", paste(dropdown_links$displayName, collapse = "','"), "'")
+    sql_query <- paste("SELECT id FROM dropdown WHERE name IN (", query, ")")
+    dropdown_id <- dbGetQuery(benchcon, sql_query)
+    
+    query <- paste0("'", paste(dropdown_id, collapse = "','"), "'")
+    sql_query <- paste("SELECT id, name FROM dropdown_option$raw WHERE dropdown_id IN (", query, ")")
+    dropdown_id <- dbGetQuery(benchcon, sql_query)
+
+  return(dropdown_id)
+}
 # Function to check custom entity links
-check_custom_entity_links <- function(df, benchcon) {
+check_custom_entity_links <- function(df, benchcon, schema_details) {
+   entity_links <- schema_details %>%
+    filter(displayName %in% colnames(df))%>%
+    filter(type %in% c("custom_entity_link", "entity_link", "dropdown")) %>%
+    select(name, displayName, type)
   
-  schema_details<- schema_details()
+  entity_links_name <- as.vector(entity_links$name)
+  entity_links_displayname <- as.vector(entity_links$displayName)
   
-  entity_links<- schema_details %>%
-    filter(type %in% c("custom_entity_link", "entity_link")) %>%
-    select(name,displayName)
   
-  entity_links_name<- as.vector(entity_links$name)
-  entity_links_displayname<- as.vector(entity_links$displayName)
   
-  entity_data<- df %>%
+  entity_data <- df %>%
     select(all_of(entity_links_displayname))
   
-  entity_data<- sapply(entity_data, unique)
+  entity_data <- sapply(entity_data, unique)
   
-  entity_match<- function(vec){
+  entity_match <- function(vec) {
     query <- paste0("'", paste(vec, collapse = "','"), "'")
     
     sql_query <- sprintf("SELECT \"file_registry_id$\" FROM strain WHERE \"file_registry_id$\" IN (%s)", query)
-    check1<- dbGetQuery(benchcon, sql_query)$`file_registry_id$`
+    check1 <- dbGetQuery(benchcon, sql_query)$`file_registry_id$`
     
     sql_query <- sprintf("SELECT name FROM entity WHERE name IN (%s)", query)
-    check2<- dbGetQuery(benchcon, sql_query)$name
+    check2 <- dbGetQuery(benchcon, sql_query)$name
     setdiff(vec, c(check1, check2))
     
+    
+    check3 <- create_dropdown_index(df, schema_details)$name
+    setdiff(vec, c(check1, check2, check3))
   }
   
   unmatched <- lapply(entity_data, entity_match)
@@ -194,66 +258,64 @@ check_custom_entity_links <- function(df, benchcon) {
 }
 
 # Function to convert custom entity links to internal IDs
-
-convert_custom_entity_links <- function(df, benchcon) {
-  # Access the reactive dataframe schema_details
-  schema_details <- schema_details()
+convert_custom_entity_links <- function(df, schema_details) {
   
-  # Identify custom entity links and entity links
+
+  # Get the entity links details from the schema and filter for existing columns
   entity_links <- schema_details %>%
-    filter(type %in% c("custom_entity_link", "entity_link")) %>%
+    filter(displayName %in% colnames(df)) %>%
+    filter(type %in% c("custom_entity_link", "entity_link", "dropdown")) %>%
     select(name, displayName)
   
-  entity_links_displayname <- as.vector(entity_links$displayName)
+  entity_links_displayname <- entity_links$displayName
   
-  # Extract unique values from the entity columns in the dataframe
+  # Collect unique non-NA values from the entity link columns
   entity_data <- df %>%
     select(all_of(entity_links_displayname)) %>%
     unique() %>%
-    unlist()
+    unlist() %>%
+    .[!is.na(.)]
   
-  # Generate the query string
-  query <- paste0("'", paste(entity_data, collapse = "','"), "'")
-  
-  # Fetch data from the strain table
-  sql_query <- sprintf("SELECT id, \"file_registry_id$\" FROM strain WHERE \"file_registry_id$\" IN (%s)", query)
-  check1 <- dbGetQuery(benchcon, sql_query)
-  colnames(check1) <- c("id", "name")
-  
-  # Fetch data from the entity table
-  sql_query <- sprintf("SELECT id, name FROM entity WHERE name IN (%s)", query)
-  check2 <- dbGetQuery(benchcon, sql_query)
-  
-  # Combine the results into a single index dataframe
-  index <- rbind(check1, check2)
-  
-  # Iterate through each column in df that matches displayName in entity_links
-  for (display_name in entity_links_displayname) {
-    # Replace the values in the dataframe with the IDs from the index
-    df[[display_name]] <- sapply(df[[display_name]], function(x) {
-      match_value <- index$id[match(x, index$name)]
-      if (is.na(match_value)) return(NA) else return(match_value)
-    })
+  if (length(entity_data) > 0) {
+    query <- paste0("'", paste(entity_data, collapse = "','"), "'")
+    
+    # Query to get matching entities from the database
+    sql_query1 <- sprintf("SELECT id, \"file_registry_id$\" AS name FROM strain WHERE \"file_registry_id$\" IN (%s)", query)
+    check1 <- dbGetQuery(benchcon, sql_query1)
+    
+    sql_query2 <- sprintf("SELECT id, name FROM entity WHERE name IN (%s)", query)
+    check2 <- dbGetQuery(benchcon, sql_query2)
+    
+    
+    check3 <- create_dropdown_index(df, schema_details)
+    
+    
+    index <- rbind(check1, check2, check3)
+    
+    # Replace entity link values in the dataframe with their corresponding ids
+    for (display_name in entity_links_displayname) {
+      df[[display_name]] <- sapply(df[[display_name]], function(x) {
+        if (is.na(x)) {
+          return(NA)
+        }
+        match_value <- index$id[match(x, index$name)]
+        if (is.na(match_value)) return(NA) else return(match_value)
+      })
+    }
   }
   
-  # Remove rows where any of the IDs are NA
-  df <- df[complete.cases(df), ]
-  df<- df %>%
-    select(all_of(schema_details$displayName))
-  
+  # The dataframe is already filtered, no need to intersect with schema details again
   return(df)
 }
 
 
 
-create_df_for_payload<- function(df){
-  unmatched <- check_custom_entity_links(df, benchcon)
-  df_filtered<- remove_unmatched_rows(df, unmatched)
-  df_filtered_converted<- convert_custom_entity_links(df_filtered)
+create_df_for_payload <- function(df, benchcon, schema_details) {
+  unmatched <- check_custom_entity_links(df, benchcon, schema_details)
+  df_filtered <- remove_unmatched_rows(df, unmatched)
+  df_filtered_converted <- convert_custom_entity_links(df_filtered, benchcon, schema_details)
   return(df_filtered_converted)
 }
-
-
 
 # Function to remove unmatched rows
 remove_unmatched_rows <- function(df, unmatched) {
@@ -284,12 +346,28 @@ send_request <- function(endpoint_url, secret_key, json_payload) {
 # Function to get task status
 get_task_status <- function(taskid, api_key) {
   url <- "https://helaina.benchling.com/api/v2/tasks"
-  response <- get_response(url = paste0(url, "/", taskid),
-                           query_params = list(),
-                           secret_key = api_key)
-  result <- parse_response(response)$status
+  response <- GET(url = paste0(url, "/", taskid), add_headers(.headers = c("accept" = "application/json")), authenticate(api_key, ""))
+  response_data <- content(response, "parsed")
+  
+  if (!is.null(response_data$message)) {
+    error_details <- if (!is.null(response_data$error)) {
+      # Extract error messages and format them into a dataframe
+      error_messages <- do.call(rbind, lapply(response_data$error, function(e) {
+        data.frame(Index = e$index, Message = e$message, stringsAsFactors = FALSE)
+      }))
+    } else {
+      data.frame(Index = NA, Message = "No additional error details available.", stringsAsFactors = FALSE)
+    }
+    status_df <- data.frame(Status = response_data$status, Message = response_data$message, stringsAsFactors = FALSE)
+    result <- list(status_df = status_df, error_details = error_messages)
+  } else {
+    result <- list(status_df = data.frame(Status = response_data$status, Message = "", stringsAsFactors = FALSE), error_details = NULL)
+  }
+  
   return(result)
 }
+##Logic to get project ID and notebook entries and then table IDs from it
+
 
 # Shiny UI
 ui <- fluidPage(
@@ -297,6 +375,10 @@ ui <- fluidPage(
   titlePanel("File Upload and API Integration"),
   sidebarLayout(
     sidebarPanel(
+      selectInput("project", "Select a Project:", choices = setNames(all_projects$source_id, all_projects$project_name), selected = NULL),
+      uiOutput("entry_ui"),
+      uiOutput("schema_ui"),
+    #  selectInput("schema", "Select Result Schema", choices = setNames(all_schemas$id, all_schemas$name), selected = NULL),
       fileInput("file", "Choose Excel File", accept = c(".xlsx")),
       actionButton("upload", "Upload and Process", style = "display:none;"),
       uiOutput("notebook_select"),
@@ -321,15 +403,53 @@ server <- function(input, output, session) {
   available_entries <- NULL
   task_id <- NULL
   
+  
+  observeEvent(input$project, {
+    query <- paste0("SELECT id, name FROM entry$raw WHERE source_id LIKE '", input$project, "'")
+    all_entries <- dbGetQuery(benchcon, query)
+    
+    output$entry_ui <- renderUI({
+      selectInput("entry", "Select an Entry:", choices = setNames(all_entries$id, all_entries$name), selected = NA)
+    })
+  })
+  
+ 
+  observeEvent(input$entry, {
+    req(input$entry)
+    schemas <- get_schema_id_from_entry(input$entry)
+    if(!is.null(schemas)){
+    query <- paste0("'", paste(schemas, collapse = "','"), "'")
+    
+    # Construct the SQL query using the IN clause
+    sql_query <- paste0("SELECT id, name FROM schema WHERE id IN (", query, ")")
+    
+    # Execute the SQL query
+    all_schema <- dbGetQuery(benchcon, sql_query)
+    
+    output$schema_ui <- renderUI({
+      selectInput("schema", "Following schemas were found in the noebook entry. Please select one:", choices = setNames(all_schema$id, all_schema$name), selected = NA)
+    })
+    }
+  })
+  
+  schema_details <- reactive({
+    req(input$schema)  
+    selected_schema_id <- input$schema
+    fetch_schema_details(selected_schema_id)
+  })
+ 
+  
   observeEvent(input$file, {
     req(input$file)
     df <- read_excel(input$file$datapath)
+   
     
     # Automatically check columns when file is uploaded
     user_columns <- colnames(df)
-    expected_columns <- schema_details$displayName
+    expected_columns <- schema_details()$displayName
     missing_columns <- setdiff(expected_columns, user_columns)
     
+   
     status_data <- data.frame(
       Step = character(),
       Status = character(),
@@ -339,58 +459,42 @@ server <- function(input, output, session) {
     
     if (length(missing_columns) == 0) {
       status_data <- rbind(status_data, data.frame(Step = "Column names check", Status = "Passed", Details = "All column names match the expected schema."))
-      type_check <- match_column_names(df)
       
-      if (isTRUE(type_check)) {
-        status_data <- rbind(status_data, data.frame(Step = "Data types check", Status = "Passed", Details = "All data types match the expected schema."))
-        custom_entity_check <- check_custom_entity_links(df, benchcon)
-        
-        if (all(sapply(custom_entity_check, length) == 0)) {
-          status_data <- rbind(status_data, data.frame(Step = "Custom entity links check", Status = "Passed", Details = "All custom entity links matched successfully."))
-          shinyjs::show("upload")
-          output$contents <- renderDT({
-            datatable(df)
-          })
-        } else {
-          if (length(custom_entity_check$strain) > 0) {
-            status_data <- rbind(status_data, data.frame(Step = "Custom entity links check", Status = "Failed", Details = paste("Unmatched Strains:", paste(custom_entity_check$strain, collapse = ", "))))
-          }
-          if (length(custom_entity_check$run_id) > 0) {
-            status_data <- rbind(status_data, data.frame(Step = "Custom entity links check", Status = "Failed", Details = paste("Unmatched Run IDs:", paste(custom_entity_check$run_id, collapse = ", "))))
-          }
-          if (length(custom_entity_check$exp_id) > 0) {
-            status_data <- rbind(status_data, data.frame(Step = "Custom entity links check", Status = "Failed", Details = paste("Unmatched Experiment IDs:", paste(custom_entity_check$exp_id, collapse = ", "))))
-          }
-          
-          df_filtered <<- remove_unmatched_rows(df, custom_entity_check)
-          
-          showModal(modalDialog(
-            title = "Unmatched Custom Entity Links",
-            "Unmatched custom entity links were found. Rows containing those links have been removed. Please review the data that passed QC before proceeding or fix the links and upload a new file.",
-            footer = modalButton("OK")
-          ))
-          
-          output$contents <- renderDT({
-            datatable(df_filtered)
-          })
-          
-          status_data <- rbind(status_data, data.frame(Step = "Warning", Status = "Rows Removed", Details = "Unmatched custom entity links have been removed. Please review the filtered data and either reupload an updated file or proceed with the table."))
-          
-          shinyjs::show("upload")
-        }
+      # Check for missing values
+      missing_values_check <- check_missing_values(df)
+      
+      if (is.null(missing_values_check)) {
+        status_data <- rbind(status_data, data.frame(Step = "Missing values check", Status = "Passed", Details = "No missing values found in the dataset."))
       } else {
-        type_check_df <- as.data.frame(type_check)
-        type_check_details <- paste(
-          apply(type_check_df, 1, function(row) {
-            paste("Column name:", row["Column name"], "- Expected:", row["Expected data type"], "- Uploaded:", row["Uploaded data type"])
-          }),
-          collapse = "; "
-        )
-        status_data <- rbind(status_data, data.frame(Step = "Data types check", Status = "Failed", Details = type_check_details))
-        shinyjs::hide("upload")
+        missing_values_details <- paste(missing_values_check$Column, collapse = ", ")
+        status_data <- rbind(status_data, data.frame(Step = "Missing values check", Status = "Failed", Details = paste("Columns with missing values:", missing_values_details)))
+      }
+      df<- remove_empty_columns(df, schema_details())
+      custom_entity_check <- check_custom_entity_links(df, benchcon, schema_details())
+      
+      if (all(sapply(custom_entity_check, length) == 0)) {
+        status_data <- rbind(status_data, data.frame(Step = "Custom entity check", Status = "Passed", Details = "All custom entity links matched successfully."))
+        shinyjs::show("upload")
         output$contents <- renderDT({
-          NULL
+          datatable(df)
         })
+      } else {
+        unmatched <- custom_entity_check
+        df_filtered <- remove_unmatched_rows(df, unmatched)
+        
+        showModal(modalDialog(
+          title = "Unmatched Custom Entity Links",
+          paste("Unmatched custom entity links were found. Rows containing those links have been removed. Please review the data that passed QC before proceeding or fix the links and upload a new file. Unmatched entities: ", paste(unlist(unmatched), collapse = ", ")),
+          footer = modalButton("OK")
+        ))
+        
+        output$contents <- renderDT({
+          datatable(df_filtered)
+        })
+        
+        status_data <- rbind(status_data, data.frame(Step = "Custom entity check", Status = "Failed, rows Removed", Details = "Unmatched custom entity links have been removed. Please review the filtered data and either reupload an updated file or proceed with the table."))
+        
+        shinyjs::show("upload")
       }
     } else {
       missing_columns_text <- paste(missing_columns, collapse = ", ")
@@ -406,15 +510,7 @@ server <- function(input, output, session) {
       datatable(status_data, options = list(dom = 't', pageLength = nrow(status_data)))
     })
     
-    # Fetch available notebook entries
-    response <- get_response(url = "https://helaina.benchling.com/api/v2/entries",
-                             query_params = list(
-                               projectId = "src_TidCEmsN",  # Adjust with the correct project ID
-                               pageSize = 50
-                             ),
-                             secret_key = api_key
-    )
-    
+    response <- get_response(url = "https://helaina.benchling.com/api/v2/entries", query_params = list(projectId = input$project, pageSize = 50), secret_key = api_key)
     available_entries <<- parse_response(response)$entries[, c("id", "name")]
     
     output$notebook_select <- renderUI({
@@ -422,77 +518,127 @@ server <- function(input, output, session) {
     })
   })
   
-  observeEvent(input$notebook, {
-    req(input$notebook)
-    entry_id <- input$notebook
+  observeEvent(input$entry, {
+    req(input$entry)
+    entry_id <- input$entry
     selected_entry_url <- dbGetQuery(benchcon, sprintf("SELECT url FROM entry WHERE id LIKE '%s'", entry_id))
     
     output$notebook_link <- renderUI({
       if (nrow(selected_entry_url) > 0) {
-        HTML(paste(
-          "Notebook URL: <a href='", selected_entry_url$url, "' target='_blank'>", selected_entry_url$url, "</a>"
-        ))
+        HTML(paste("Notebook entry URL: <a href='", selected_entry_url$url, "' target='_blank'>", selected_entry_url$url, "</a>"))
       } else {
         "No notebook selected"
       }
     })
   })
   
-  # Reactive to get the project ID based on the selected notebook name
-  project_id <- reactive({
-    req(input$notebook)
-    id <- available_entries %>%
-      filter(id == input$notebook) %>%
-      select(id)
-    as.character(id$id)
-  })
+
+  task_ids <- reactiveVal(list())
+  task_statuses <- reactiveValues()
   
-  observe({
-    print(project_id())
-  })
+  
   observeEvent(input$upload, {
     req(input$file)
-    req(input$notebook)
+    req(input$entry)
+    req(input$project)
+    req(input$schema)
+    
     df <- read_excel(input$file$datapath)
     
-    # Convert to character to ensure user-uploaded values are shown
-    df$Strain <- as.character(df$Strain)
-    df$`Run ID` <- as.character(df$`Run ID`)
-    df$`Experiment ID` <- as.character(df$`Experiment ID`)
+    schemaID <- input$schema
+    projectID <- input$project
+    entryID <- input$entry
+    tableID <- get_table_id(entryID, schemaID)
+   
     
-    schemaID <- "assaysch_bSdwxZvH"
     endpointURL <- "https://helaina.benchling.com/api/v2/assay-results:bulk-create"
     
-    # Create the JSON payload
-    df_filtered_converted<- create_df_for_payload(df)
-    payload <- create_payload(df_filtered_converted, schemaID, projectID, tableID)
+    df<- remove_empty_columns(df, schema_details())
+    unmatched <- check_custom_entity_links(df =  df,benchcon = benchcon,schema_details =  schema_details())
+
+    df_filtered <- remove_unmatched_rows(df = df, unmatched)
     
-    json_payload <- toJSON(payload, auto_unbox = TRUE, pretty = TRUE)
-    print(json_payload)
-    response <- send_request(endpoint_url = endpointURL, secret_key = api_key, json_payload)
-    
-    task_id <<- parse_response(response)$taskId
-    
-    output$response <- renderPrint({
-      content(response, as = "text")
-    })
-    
-    output$task_ui <- renderUI({
-      wellPanel(
-        textInput("task_id", "Task ID", value = task_id),
-        actionButton("check_task", "Check Task Status")
-      )
-    })
+    df_filtered_converted <- convert_custom_entity_links(df_filtered, schema_details())
+    df_filtered_converted <- as.data.frame(df_filtered_converted)
+    # Split the dataframe into chunks of 499 rows
+    chunks <- split_into_chunks(df_filtered_converted, 499)
+    print(chunks[[1]]$`Fermentation Phase`)
+    if (length(chunks) > length(tableID)) {
+      showModal(modalDialog(
+        title = "Insufficient Tables",
+        paste("Please use the link to the notebook entry and insert", length(chunks) - length(tableID), "more result schema(s).")
+      ))
+    } else {
+      showModal(modalDialog(
+        title = "Uploading",
+        paste("The data you are uploading has",nrow(df_filtered_converted ),"rows",
+              "and it will fit in",length(chunks), "result schema(s). Please use check task id button to check the status of upload")
+      ))
+      task_ids_list <- list()
+      for (i in seq_along(chunks)) {
+        json_payload <- create_json_payload(chunks[[i]], 
+                                            schema_id = schemaID, 
+                                            project_id = projectID,
+                                            table_id = tableID[i], 
+                                            schema_details = schema_details())
+        
+        
+        
+        response <- send_request(endpoint_url = endpointURL, secret_key = api_key, json_payload)
+        
+        task_id <- parse_response(response)$taskId
+        task_ids_list[[i]] <- task_id
+        
+        # Initialize task status
+        task_statuses[[task_id]] <- "Pending"
+        
+        # Update the reactive value
+        task_ids(task_ids_list)
+      }
+    }
   })
   
-  observeEvent(input$check_task, {
-    req(input$task_id)
-    task_status <- get_task_status(input$task_id, api_key)
+  output$task_ui <- renderUI({
+    tasks <- task_ids()
+    if (length(tasks) == 0) {
+      return(NULL)
+    }
     
-    output$task_status <- renderText({
-      paste("Task Status:", task_status)
-    })
+    do.call(tagList, lapply(seq_along(tasks), function(i) {
+      wellPanel(
+        textInput(paste0("task_id_", i), paste("Task ID", i), value = tasks[[i]]),
+        actionButton(paste0("check_task_", i), "Check Task Status"),
+        DTOutput(paste0("status_", tasks[[i]])),
+        DTOutput(paste0("errors_", tasks[[i]]))
+      )
+    }))
   })
+  
+  
+  observe({
+    tasks <- task_ids()
+    for (i in seq_along(tasks)) {
+      local({
+        task_id <- tasks[[i]]
+        observeEvent(input[[paste0("check_task_", i)]], {
+          status_result <- get_task_status(task_id, api_key)
+          task_statuses[[paste0("status_", task_id)]] <- status_result$status_df
+          task_statuses[[paste0("errors_", task_id)]] <- status_result$error_details
+          
+          output[[paste0("status_", task_id)]] <- renderDT({
+            datatable(task_statuses[[paste0("status_", task_id)]], options = list(dom = 't', paging = FALSE))
+          })
+          
+          output[[paste0("errors_", task_id)]] <- renderDT({
+            datatable(task_statuses[[paste0("errors_", task_id)]], options = list(dom = 't', paging = FALSE))
+          })
+        })
+      })
+    }
+  })
+  
+  
+  
 }
 
 shinyApp(ui, server)

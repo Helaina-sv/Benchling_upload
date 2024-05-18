@@ -433,8 +433,28 @@ server <- function(input, output, session) {
     })
     
   })
-  
-  
+  observeEvent(input$project, {
+    # Reset UI elements when a new project is selected
+    updateSelectInput(session, "entry", selected = NULL)
+    updateSelectInput(session, "schema", selected = NULL)
+    output$entry_ui <- renderUI(NULL)
+    output$notebook_link <- renderUI(NULL)
+    output$goentry <- renderUI(NULL)
+    output$schema_ui <- renderUI(NULL)
+    output$file_uploader <- renderUI(NULL)
+    output$run_qc <- renderUI(NULL)
+    
+    # Hide the upload button
+    shinyjs::hide("upload")
+    
+    # Clear the data table
+    output$status_table <- DT::renderDataTable(NULL)
+    output$contents <- DT::renderDataTable(NULL)
+    
+    # Reset QC panel
+    output$response <- renderText("")
+    output$task_status <- renderText("")
+  })
   observeEvent(input$goproject, {
     query <- paste0("SELECT id, name FROM entry$raw WHERE source_id LIKE '", input$project, "'")
     all_entries <- dbGetQuery(benchcon, query)
@@ -567,11 +587,11 @@ server <- function(input, output, session) {
       }
       if (length(matching_columns) == 0 ) {
         showModal(modalDialog(
-          title = "Schema Mismatch",
+          title = "Schema Mismatch: Nothing to be uploaded!",
           paste("None of the columns match the expected schema structure. The expected columns in the selected schema are:", 
                 paste(expected_columns, collapse = ", ")),
           easyClose = TRUE,
-          footer = modalButton("Acknowledge and proceed")
+          footer = modalButton("Acknowledge and  reupload")
         ))
         # Stop further execution
         req(FALSE)

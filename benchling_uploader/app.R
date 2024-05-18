@@ -17,7 +17,7 @@ create_dummy_data<- function(){
   all_entity<- dbGetQuery(benchcon, "SELECT * FROM entity")
   all_dropdown<- dbGetQuery(benchcon, "SELECT * FROM dropdown_option$raw")
   all_dropdown_menu<- dbGetQuery(benchcon, "SELECT * FROM dropdown")
-  
+  all_users<- dbGetQuery(benchcon, "SELECT * FROM user$raw")
   all_entries<- dbGetQuery(benchcon, "SELECT * FROM entry")
   all_tables<- dbGetQuery(benchcon, "SELECT * FROM information_schema.tables WHERE table_type = 'BASE TABLE'")
   schema_details<- fetch_schema_details("assaysch_k6vDZiRO")
@@ -39,14 +39,22 @@ host_db <- Sys.getenv("HOST_DB")
 db_port <- Sys.getenv("DB_PORT")
 db_user <- Sys.getenv("DB_USER")
 db_password <- Sys.getenv("DB_PASSWORD")
-api_key <- Sys.getenv("BENCHLINGAPIKEY")
+#api_key<- Sys.getenv("BENCHLINGAPIKEY")
+api_key <- "sk_xRhZUegRsZUH6mUPwcdnRqfxdQYRf"
 
 benchcon <- dbConnect(RPostgres::Postgres(), dbname = db, host = host_db, port = db_port, user = db_user, password = db_password)
 
 
 all_projects<- dbGetQuery(benchcon, "SELECT id,name FROM project$raw") 
 colnames(all_projects)<- c("source_id", "project_name")
-  
+all_projects<- all_projects %>%
+  filter(project_name %in% c("Early-Stage R&D Team",
+                             "Late Stage R&D",
+                            # "Nutritional Biology and Safety",
+                             "Bioinformatics",
+                             "Analytical Chemistry",
+                             "Protein Characterization from External Partners"))
+
 get_entries <- function(projectid) {
   query <- paste0("SELECT id, name FROM entry$raw WHERE source_id LIKE '", projectid, "'")
     all_entries <- dbGetQuery(benchcon, query)
@@ -194,12 +202,13 @@ create_json_payload <- function(df, schema_id, project_id, table_id, schema_deta
 remove_empty_columns<- function(df, schema_details){
   required<- schema_details %>% 
     select(displayName, isRequired) %>%
-    filter(isRequired == FALSE)
+    filter(isRequired == FALSE)%>%
+    filter(displayName %in% colnames(df))
   
   for (name in required$displayName ){
     if(all(is.na(df[[name]]))){
       df<- df %>%
-        select( - all_of(name))
+        select(- all_of(name))
     }
   }
   return(df)
@@ -371,25 +380,39 @@ get_task_status <- function(taskid, api_key) {
 
 # Shiny UI
 ui <- fluidPage(
+  theme = shinythemes::shinytheme("cerulean"),
   useShinyjs(),
-  titlePanel("File Upload and API Integration"),
+  titlePanel("Benchling Uploader"),
   sidebarLayout(
     sidebarPanel(
-      selectInput("project", "Select a Project:", choices = setNames(all_projects$source_id, all_projects$project_name), selected = NULL),
+      selectInput("project", "Select a Project:", 
+                  choices = setNames(all_projects$source_id, all_projects$project_name),
+                  selected = NULL),
+      actionButton("goproject","Show notebook entries"),
       uiOutput("entry_ui"),
-      uiOutput("schema_ui"),
-    #  selectInput("schema", "Select Result Schema", choices = setNames(all_schemas$id, all_schemas$name), selected = NULL),
-      fileInput("file", "Choose Excel File", accept = c(".xlsx")),
-      actionButton("upload", "Upload and Process", style = "display:none;"),
-      uiOutput("notebook_select"),
       uiOutput("notebook_link"),
+      uiOutput("goentry"),
+      uiOutput("schema_ui"),
+      uiOutput("file_uploader"),
+     # uiOutput("notebook_select"),
+     actionButton("upload", "Upload to Benchling", style = "display:none;"),
       uiOutput("task_ui")
     ),
     mainPanel(
       wellPanel(
+        h3("Quality check", style = "margin-top: 0;"),
+        fluidRow(
+          column(
+            width = 4,
+            uiOutput("run_qc"), 
+          ),
+        ),
+        
         DTOutput("status_table")
       ),
       wellPanel(
+        h3("Data tables", style = "margin-top: 0;"),
+        p("QC passed data to be uploaded"),
         DTOutput("contents")
       ),
       verbatimTextOutput("response"),
@@ -403,18 +426,36 @@ server <- function(input, output, session) {
   available_entries <- NULL
   task_id <- NULL
   
+  observeEvent(input$file, {
+    req(input$file)
+    output$run_qc <- renderUI({
+      actionButton("qc", "Run QC")
+    })
+    
+  })
   
-  observeEvent(input$project, {
+  
+  observeEvent(input$goproject, {
     query <- paste0("SELECT id, name FROM entry$raw WHERE source_id LIKE '", input$project, "'")
     all_entries <- dbGetQuery(benchcon, query)
     
     output$entry_ui <- renderUI({
-      selectInput("entry", "Select an Entry:", choices = setNames(all_entries$id, all_entries$name), selected = NA)
+      selectInput("entry", "Select Notebook Entry:", choices = setNames(all_entries$id, all_entries$name), selected = NA)
+    })
+  })
+  observeEvent(input$entry, {
+    output$goentry <- renderUI({
+      actionButton("showschemas", "Show available schemas")
     })
   })
   
- 
-  observeEvent(input$entry, {
+  observeEvent(input$schema,{
+    req(input$schema)
+    output$file_uploader<- renderUI({
+      fileInput("file", "Choose Excel File", accept = c(".xlsx"))
+    })
+  })
+  observeEvent(input$showschemas, {
     req(input$entry)
     schemas <- get_schema_id_from_entry(input$entry)
     if(!is.null(schemas)){
@@ -427,7 +468,10 @@ server <- function(input, output, session) {
     all_schema <- dbGetQuery(benchcon, sql_query)
     
     output$schema_ui <- renderUI({
-      selectInput("schema", "Following schemas were found in the noebook entry. Please select one:", choices = setNames(all_schema$id, all_schema$name), selected = NA)
+      selectInput("schema", 
+                  "Following schemas were found in the selected notebook entry. Please make a selection:", 
+                  choices = setNames(all_schema$id, all_schema$name), 
+                  selected = character(0))
     })
     }
   })
@@ -438,17 +482,47 @@ server <- function(input, output, session) {
     fetch_schema_details(selected_schema_id)
   })
  
-  
-  observeEvent(input$file, {
+  ##QC function
+  observeEvent(input$qc, {
     req(input$file)
     df <- read_excel(input$file$datapath)
    
+    required_columns<- schema_details()%>%
+      filter(isRequired == TRUE)%>%
+      select(displayName)
+    required_columns<- as.character(required_columns$displaName)
     
+    if(!all(required_columns%in% colnames(df))){
+      showModal(modalDialog(
+        title = "",
+        paste("Data cannot be uploaded because required columns are missing. Please ensure that following columns are present:", 
+              paste(required_columns, collapse = ", ")),
+        easyClose = TRUE,
+        footer = NULL
+      ))
+    }
+    
+   
     # Automatically check columns when file is uploaded
     user_columns <- colnames(df)
     expected_columns <- schema_details()$displayName
     missing_columns <- setdiff(expected_columns, user_columns)
+    matching_columns <- intersect(expected_columns, user_columns)
     
+    df<- df %>%
+      select(all_of(matching_columns))
+    
+    if(length(user_columns)> ncol(df)){
+      showModal(modalDialog(
+        title = "Columns Mismatch",
+        paste("There are columns in your uploaded file that are either missing or do not match the expected schema structure. Unmatched columns have been dropped. While you can still upload the columns that match, please ensure that it is the intended and correct file. Following columns were expected but not found in your uploaded file: ", 
+              paste(missing_columns, collapse = ", ")),
+        easyClose = TRUE,
+        footer = tagList(
+          modalButton("Acknowledge and Proceed")
+        )
+      ))
+    }
    
     status_data <- data.frame(
       Step = character(),
@@ -456,20 +530,62 @@ server <- function(input, output, session) {
       Details = character(),
       stringsAsFactors = FALSE
     )
-    
+   
     if (length(missing_columns) == 0) {
       status_data <- rbind(status_data, data.frame(Step = "Column names check", Status = "Passed", Details = "All column names match the expected schema."))
-      
+    } else {
+      missing_columns_text <- paste(missing_columns, collapse = ", ")
+      expected_columns_text <- paste(expected_columns, collapse = ", ")
+      status_data <- rbind(status_data, data.frame(Step = "Column names check", Status = "Failed", Details = paste("Missing columns:", missing_columns_text, ". Expected columns:", expected_columns_text)))
+      shinyjs::hide("upload")
+    }
+
+    
+    if (all(required_columns%in% colnames(df))) {
+      status_data <- rbind(status_data, data.frame(Step = "Required Columns check", Status = "Passed", Details = "All required columns are present."))
+    } else {
+      missing_columns_text <- paste(required_columns, collapse = ", ")
+      expected_columns_text <- ""
+      status_data <- rbind(status_data, data.frame(Step = "Required Columns check", Status = "Failed", Details = paste("Required columns are:", required_columns)))
+      shinyjs::hide("upload")
+      output$contents <- renderDT({
+        datatable(df, options = list(scrollX = TRUE))
+      })
+    }
+    
       # Check for missing values
       missing_values_check <- check_missing_values(df)
       
       if (is.null(missing_values_check)) {
         status_data <- rbind(status_data, data.frame(Step = "Missing values check", Status = "Passed", Details = "No missing values found in the dataset."))
       } else {
+        showModal(modalDialog(
+          title = "Columns Mismatch",
+          paste("There are columns in your uploaded file that are either missing or do not match the expected schema structure. While you can still upload the matching columns data, please ensure that it is the intended and correct file. Following columns are mismatched: ", 
+                paste(missing_columns, collapse = ", ")),
+          easyClose = TRUE,
+          footer = tagList(
+            modalButton("Close")
+          )
+        ))
         missing_values_details <- paste(missing_values_check$Column, collapse = ", ")
         status_data <- rbind(status_data, data.frame(Step = "Missing values check", Status = "Failed", Details = paste("Columns with missing values:", missing_values_details)))
       }
-      df<- remove_empty_columns(df, schema_details())
+      if (length(matching_columns) == 0 ) {
+        showModal(modalDialog(
+          title = "Schema Mismatch",
+          paste("None of the columns match the expected schema structure. The expected columns in the selected schema are:", 
+                paste(expected_columns, collapse = ", ")),
+          easyClose = TRUE,
+          footer = modalButton("Acknowledge and proceed")
+        ))
+        # Stop further execution
+        req(FALSE)
+      }else{
+        
+        df<- remove_empty_columns(df, schema_details())
+        
+      
       custom_entity_check <- check_custom_entity_links(df, benchcon, schema_details())
       
       if (all(sapply(custom_entity_check, length) == 0)) {
@@ -489,22 +605,13 @@ server <- function(input, output, session) {
         ))
         
         output$contents <- renderDT({
-          datatable(df_filtered)
+          datatable(df_filtered,options = list(scrollX = TRUE))
         })
         
         status_data <- rbind(status_data, data.frame(Step = "Custom entity check", Status = "Failed, rows Removed", Details = "Unmatched custom entity links have been removed. Please review the filtered data and either reupload an updated file or proceed with the table."))
         
         shinyjs::show("upload")
       }
-    } else {
-      missing_columns_text <- paste(missing_columns, collapse = ", ")
-      expected_columns_text <- paste(expected_columns, collapse = ", ")
-      status_data <- rbind(status_data, data.frame(Step = "Column names check", Status = "Failed", Details = paste("Missing columns:", missing_columns_text, ". Expected columns:", expected_columns_text)))
-      shinyjs::hide("upload")
-      output$contents <- renderDT({
-        NULL
-      })
-    }
     
     output$status_table <- renderDT({
       datatable(status_data, options = list(dom = 't', pageLength = nrow(status_data)))
@@ -516,6 +623,7 @@ server <- function(input, output, session) {
     output$notebook_select <- renderUI({
       selectInput("notebook", "Select Notebook entry", choices = setNames(available_entries$id, available_entries$name), selected = NULL)
     })
+      }
   })
   
   observeEvent(input$entry, {
@@ -550,6 +658,19 @@ server <- function(input, output, session) {
     entryID <- input$entry
     tableID <- get_table_id(entryID, schemaID)
    
+    required_columns<- schema_details()%>%
+      filter(isRequired == TRUE)%>%
+      select(displayName)
+    required_columns<- as.character(required_columns$displaName)
+    
+    # Automatically check columns when file is uploaded
+    user_columns <- colnames(df)
+    expected_columns <- schema_details()$displayName
+    missing_columns <- setdiff(expected_columns, user_columns)
+    matching_columns <- intersect(expected_columns, user_columns)
+    
+    df<- df %>%
+      select(all_of(matching_columns))
     
     endpointURL <- "https://helaina.benchling.com/api/v2/assay-results:bulk-create"
     
@@ -562,7 +683,6 @@ server <- function(input, output, session) {
     df_filtered_converted <- as.data.frame(df_filtered_converted)
     # Split the dataframe into chunks of 499 rows
     chunks <- split_into_chunks(df_filtered_converted, 499)
-    print(chunks[[1]]$`Fermentation Phase`)
     if (length(chunks) > length(tableID)) {
       showModal(modalDialog(
         title = "Insufficient Tables",

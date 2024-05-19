@@ -11,6 +11,7 @@ library(readxl)
 library(shinyjs)
 library(DT)
 library(plyr)
+library(openxlsx)
 
 create_dummy_data<- function(){
   all_schemas<- dbGetQuery(benchcon, "SELECT * FROM schema")
@@ -390,10 +391,30 @@ ui <- fluidPage(
                   selected = NULL),
       actionButton("goproject","Show notebook entries"),
       uiOutput("entry_ui"),
-      uiOutput("notebook_link"),
-      uiOutput("goentry"),
+      fluidRow(
+        column(
+          width = 5,
+          uiOutput("goentry"),
+        ),
+        column(
+          width = 2,
+          uiOutput("notebook_link"),
+          tags$script(
+            'Shiny.addCustomMessageHandler("jsCode", function(message) {
+      eval(message.code);
+    });'
+          )
+        ),
+      ),
       uiOutput("schema_ui"),
-      uiOutput("file_uploader"),
+      uiOutput("download_template"),
+      
+      fluidRow(
+        column(
+          width = 8,
+          uiOutput("file_uploader")
+        )
+      ),
      # uiOutput("notebook_select"),
      actionButton("upload", "Upload to Benchling", style = "display:none;"),
       uiOutput("task_ui")
@@ -472,9 +493,43 @@ server <- function(input, output, session) {
   observeEvent(input$schema,{
     req(input$schema)
     output$file_uploader<- renderUI({
-      fileInput("file", "Choose Excel File", accept = c(".xlsx"))
+      fileInput("file", "Upload file", accept = c(".xlsx"))
     })
   })
+  
+  observeEvent(input$schema, {
+    output$download_template <- renderUI({
+      if (!is.null(input$schema) && input$schema != "") {
+        downloadButton("download_button", "Download Schema Template")
+      } else {
+        "No schema selected"
+      }
+    })
+  })
+  
+  output$download_button <- downloadHandler(
+    filename = function() {
+      paste("schema_template.xlsx")
+    },
+    content = function(file) {
+      # Assuming schema_details is a function returning a dataframe
+      details <- schema_details()
+      
+      # Create a new workbook
+      wb <- createWorkbook()
+      addWorksheet(wb, "Sheet1")
+      
+      # Write the display names as column headers
+      writeData(wb, sheet = "Sheet1", x = as.data.frame(t(details$displayName)), colNames = FALSE, rowNames = FALSE)
+      
+      # Write the types as the first row of data
+      writeData(wb, sheet = "Sheet1", x = as.data.frame(t(details$type)), startRow = 2, colNames = FALSE, rowNames = FALSE)
+      
+      # Save the workbook to the specified file
+      saveWorkbook(wb, file, overwrite = TRUE)
+    }
+  )
+  
   observeEvent(input$showschemas, {
     req(input$entry)
     schemas <- get_schema_id_from_entry(input$entry)
@@ -606,7 +661,7 @@ server <- function(input, output, session) {
         status_data <- rbind(status_data, data.frame(Step = "Custom entity check", Status = "Passed", Details = "All custom entity links matched successfully."))
         shinyjs::show("upload")
         output$contents <- renderDT({
-          datatable(df)
+          datatable(df,options = list(scrollX = TRUE))
         })
       } else {
         unmatched <- custom_entity_check
@@ -640,21 +695,34 @@ server <- function(input, output, session) {
       }
   })
   
-  observeEvent(input$entry, {
+ 
+  selected_entry_url <- reactive({
     req(input$entry)
     entry_id <- input$entry
-    selected_entry_url <- dbGetQuery(benchcon, sprintf("SELECT url FROM entry WHERE id LIKE '%s'", entry_id))
-    
-    output$notebook_link <- renderUI({
-      if (nrow(selected_entry_url) > 0) {
-        HTML(paste("Notebook entry URL: <a href='", selected_entry_url$url, "' target='_blank'>", selected_entry_url$url, "</a>"))
-      } else {
-        "No notebook selected"
-      }
-    })
+    dbGetQuery(benchcon, sprintf("SELECT url FROM entry WHERE id LIKE '%s'", entry_id))
   })
   
 
+  observe({
+    url <- selected_entry_url()
+    if (!is.null(url) && nrow(url) > 0) {
+      output$notebook_link <- renderUI({
+        actionButton("go_button", "Go to entry")
+      })
+    } else {
+      output$notebook_link <- renderUI({
+        "No notebook selected"
+      })
+    }
+  })
+  observeEvent(input$go_button, {
+    url <- selected_entry_url()
+    if (!is.null(url) && nrow(url) > 0) {
+      js_code <- sprintf("window.open('%s', '_blank')", url$url[1])
+      session$sendCustomMessage(type = 'jsCode', list(code = js_code))
+    }
+  })
+  
   task_ids <- reactiveVal(list())
   task_statuses <- reactiveValues()
   

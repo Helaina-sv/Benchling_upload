@@ -432,9 +432,10 @@ ui <- fluidPage(
         DTOutput("status_table")
       ),
       wellPanel(
-        h3("Data tables", style = "margin-top: 0;"),
-        p("QC passed data to be uploaded"),
-        DTOutput("contents")
+        tabsetPanel(
+          tabPanel("Data Uploaded", DTOutput("sheet_contents")),
+          tabPanel("Data Passed QC", DTOutput("qc_contents"))
+        )
       ),
       verbatimTextOutput("response"),
       textOutput("task_status")
@@ -470,7 +471,8 @@ server <- function(input, output, session) {
     
     # Clear the data table
     output$status_table <- DT::renderDataTable(NULL)
-    output$contents <- DT::renderDataTable(NULL)
+    output$sheet_contents <- DT::renderDataTable(NULL)
+    output$qc_contents <- DT::renderDataTable(NULL)
     
     # Reset QC panel
     output$response <- renderText("")
@@ -561,7 +563,12 @@ server <- function(input, output, session) {
   observeEvent(input$qc, {
     req(input$file)
     df <- read_excel(input$file$datapath)
-   
+    df_uploaded<- df
+    output$sheet_contents <- renderDT({
+      datatable(df_uploaded,options = list(scrollX = TRUE))
+    })
+    
+    
     required_columns<- schema_details()%>%
       filter(isRequired == TRUE)%>%
       select(displayName)
@@ -625,9 +632,7 @@ server <- function(input, output, session) {
       expected_columns_text <- ""
       status_data <- rbind(status_data, data.frame(Step = "Required Columns check", Status = "Failed. Data cannot be uploaded", Details = paste("Required columns are:", required_columns)))
       shinyjs::hide("upload")
-      output$contents <- renderDT({
-        datatable(df, options = list(scrollX = TRUE))
-      })
+    
     }
     
       # Check for missing values
@@ -660,9 +665,7 @@ server <- function(input, output, session) {
       if (all(sapply(custom_entity_check, length) == 0)) {
         status_data <- rbind(status_data, data.frame(Step = "Custom entity check", Status = "Passed", Details = "All custom entity links matched successfully."))
         shinyjs::show("upload")
-        output$contents <- renderDT({
-          datatable(df,options = list(scrollX = TRUE))
-        })
+     
       } else {
         unmatched <- custom_entity_check
         df_filtered <- remove_unmatched_rows(df, unmatched)
@@ -673,13 +676,16 @@ server <- function(input, output, session) {
           footer = modalButton("OK")
         ))
         
-        output$contents <- renderDT({
-          datatable(df_filtered,options = list(scrollX = TRUE))
-        })
-        
         status_data <- rbind(status_data, data.frame(Step = "Custom entity check", Status = "Failed, rows containing unmatched entites were removed", Details = "Unmatched custom entity links have been removed. Please review the filtered data and either reupload an updated file or proceed with the table."))
         
         shinyjs::show("upload")
+        
+        print(df_filtered)
+        
+        output$qc_contents <- renderDT({
+          datatable(df_filtered,options = list(scrollX = TRUE))
+        })
+        
       }
     
     output$status_table <- renderDT({
@@ -844,3 +850,6 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
+
+
+

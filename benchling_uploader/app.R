@@ -22,10 +22,10 @@ create_dummy_data<- function(){
   all_entries<- dbGetQuery(benchcon, "SELECT * FROM entry")
   all_tables<- dbGetQuery(benchcon, "SELECT * FROM information_schema.tables WHERE table_type = 'BASE TABLE'")
   schema_details<- fetch_schema_details("assaysch_k6vDZiRO")
-  df<- read_excel("~/Downloads/Production Run Sampling.xlsx")
+  df<- read_excel("~/Desktop/HTS USP Sampling ID Results 1.xlsx")
   df<- remove_empty_columns(df, schema_details)
   
-  box<- dbGetQuery(benchcon, "SELECT * FROM 	container$raw")
+  #box<- dbGetQuery(benchcon, "SELECT * FROM 	container$raw")
   
   #hts<- dbGetQuery(benchcon, "SELECT * FROM hts_usp_sampling_id_results$raw LIMIT 5000")
   
@@ -486,7 +486,6 @@ server <- function(input, output, session) {
   observeEvent(input$entry, {
     # Reset UI elements when a new project is selected
     output$notebook_link <- renderUI(NULL)
-    output$goentry <- renderUI(NULL)
     output$file_uploader <- renderUI(NULL)
     output$run_qc <- renderUI(NULL)
     output$schema_ui <- renderUI(NULL)

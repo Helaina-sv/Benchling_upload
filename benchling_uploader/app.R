@@ -24,15 +24,15 @@ create_dummy_data<- function(){
   schema_details<- fetch_schema_details("assaysch_k6vDZiRO")
   df<- read_excel("~/Downloads/Production Run Sampling.xlsx")
   df<- remove_empty_columns(df, schema_details)
+  
+  box<- dbGetQuery(benchcon, "SELECT * FROM 	container$raw")
+  
+  #hts<- dbGetQuery(benchcon, "SELECT * FROM hts_usp_sampling_id_results$raw LIMIT 5000")
+  
   }
 
+load_dot_env(".env")
 
-# Load environment variables
-if (file.exists(".env")) {
-  load_dot_env(".env")
-} else {
-  stop(".env file does not exist in the current working directory")
-}
 
 # Database connection details
 db <- Sys.getenv("DB")
@@ -202,7 +202,6 @@ create_json_payload <- function(df, schema_id, project_id, table_id, schema_deta
 
 remove_empty_columns<- function(df, schema_details){
   required<- schema_details %>% 
-    select(displayName, isRequired) %>%
     filter(isRequired == FALSE)%>%
     filter(displayName %in% colnames(df))
   
@@ -232,22 +231,22 @@ create_dropdown_index<- function(df, schema_details){
 }
 # Function to check custom entity links
 check_custom_entity_links <- function(df, benchcon, schema_details) {
-   entity_links <- schema_details %>%
-    filter(displayName %in% colnames(df))%>%
-    filter(type %in% c("custom_entity_link", "entity_link", "dropdown")) %>%
+  entity_links <- schema_details %>%
+    filter(displayName %in% colnames(df)) %>%
+    filter(type %in% c("custom_entity_link", "entity_link", "dropdown", "storage_link")) %>%
     select(name, displayName, type)
   
-  entity_links_name <- as.vector(entity_links$name)
   entity_links_displayname <- as.vector(entity_links$displayName)
-  
-  
   
   entity_data <- df %>%
     select(all_of(entity_links_displayname))
   
-  entity_data <- sapply(entity_data, unique)
+  entity_data <- sapply(entity_data, function(x) unique(x[!is.na(x)]))
   
   entity_match <- function(vec) {
+    if (length(vec) == 0) {
+      return(character(0))
+    }
     query <- paste0("'", paste(vec, collapse = "','"), "'")
     
     sql_query <- sprintf("SELECT \"file_registry_id$\" FROM strain WHERE \"file_registry_id$\" IN (%s)", query)
@@ -255,11 +254,13 @@ check_custom_entity_links <- function(df, benchcon, schema_details) {
     
     sql_query <- sprintf("SELECT name FROM entity WHERE name IN (%s)", query)
     check2 <- dbGetQuery(benchcon, sql_query)$name
-    setdiff(vec, c(check1, check2))
-    
     
     check3 <- create_dropdown_index(df, schema_details)$name
-    setdiff(vec, c(check1, check2, check3))
+    
+    sql_query <- sprintf("SELECT barcode FROM container$raw WHERE name IN (%s)", query)
+    check4 <- dbGetQuery(benchcon, sql_query)$barcode
+    
+    setdiff(vec, c(check1, check2, check3, check4))
   }
   
   unmatched <- lapply(entity_data, entity_match)
@@ -274,7 +275,7 @@ convert_custom_entity_links <- function(df, schema_details) {
   # Get the entity links details from the schema and filter for existing columns
   entity_links <- schema_details %>%
     filter(displayName %in% colnames(df)) %>%
-    filter(type %in% c("custom_entity_link", "entity_link", "dropdown")) %>%
+    filter(type %in% c("custom_entity_link", "entity_link", "dropdown","storage_link")) %>%
     select(name, displayName)
   
   entity_links_displayname <- entity_links$displayName
@@ -299,8 +300,10 @@ convert_custom_entity_links <- function(df, schema_details) {
     
     check3 <- create_dropdown_index(df, schema_details)
     
+    sql_query <- sprintf("SELECT id, barcode AS name FROM container$raw WHERE barcode IN (%s)", query)
+    check4 <- dbGetQuery(benchcon, sql_query)
     
-    index <- rbind(check1, check2, check3)
+    index <- rbind(check1, check2, check3, check4)
     
     # Replace entity link values in the dataframe with their corresponding ids
     for (display_name in entity_links_displayname) {
@@ -322,7 +325,8 @@ convert_custom_entity_links <- function(df, schema_details) {
 
 create_df_for_payload <- function(df, benchcon, schema_details) {
   unmatched <- check_custom_entity_links(df, benchcon, schema_details)
-  df_filtered <- remove_unmatched_rows(df, unmatched)
+  df_empty_columns_removed<- remove_empty_columns(df, schema_details)
+  df_filtered <- remove_unmatched_rows(df_empty_columns_removed, unmatched)
   df_filtered_converted <- convert_custom_entity_links(df_filtered, benchcon, schema_details)
   return(df_filtered_converted)
 }
@@ -411,23 +415,23 @@ ui <- fluidPage(
       
       fluidRow(
         column(
-          width = 8,
+          width = 8,  # Adjust as needed
           uiOutput("file_uploader")
+        ),
+        column(
+          width = 4,  # Adjust as needed
+          div(style = "margin-top: 25px;", uiOutput("run_qc"))  # Adjust margin as needed
         )
       ),
-     # uiOutput("notebook_select"),
-     actionButton("upload", "Upload to Benchling", style = "display:none;"),
+
+         actionButton("upload", "Upload to Benchling", style = "display:none;"),
+     
       uiOutput("task_ui")
     ),
     mainPanel(
       wellPanel(
         h3("Quality check", style = "margin-top: 0;"),
-        fluidRow(
-          column(
-            width = 4,
-            uiOutput("run_qc"), 
-          ),
-        ),
+       
         
         DTOutput("status_table")
       ),
@@ -465,9 +469,49 @@ server <- function(input, output, session) {
     output$schema_ui <- renderUI(NULL)
     output$file_uploader <- renderUI(NULL)
     output$run_qc <- renderUI(NULL)
+    output$download_button<- renderUI(NULL)
+    output$download_template <- renderUI(NULL)
+    # Hide the upload button
+    shinyjs::hide("upload")
+    
+    # Clear the data table
+    output$status_table <- DT::renderDataTable(NULL)
+    output$sheet_contents <- DT::renderDataTable(NULL)
+    output$qc_contents <- DT::renderDataTable(NULL)
+    
+    # Reset QC panel
+    output$response <- renderText("")
+    output$task_status <- renderText("")
+  })
+  observeEvent(input$entry, {
+    # Reset UI elements when a new project is selected
+    output$notebook_link <- renderUI(NULL)
+    output$goentry <- renderUI(NULL)
+    output$file_uploader <- renderUI(NULL)
+    output$run_qc <- renderUI(NULL)
+    output$schema_ui <- renderUI(NULL)
+    output$download_button<- renderUI(NULL)
+    output$download_template <- renderUI(NULL)
     
     # Hide the upload button
     shinyjs::hide("upload")
+    
+    # Clear the data table
+    output$status_table <- DT::renderDataTable(NULL)
+    output$sheet_contents <- DT::renderDataTable(NULL)
+    output$qc_contents <- DT::renderDataTable(NULL)
+    
+    # Reset QC panel
+    output$response <- renderText("")
+    output$task_status <- renderText("")
+  })
+  observeEvent(input$schema, {
+    # Reset UI elements when a new project is selected
+    output$run_qc <- renderUI(NULL)
+    output$download_button<- renderUI(NULL)
+    # Hide the upload button
+    shinyjs::hide("upload")
+    output$download_template <- renderUI(NULL)
     
     # Clear the data table
     output$status_table <- DT::renderDataTable(NULL)
@@ -563,18 +607,17 @@ server <- function(input, output, session) {
   observeEvent(input$qc, {
     req(input$file)
     df <- read_excel(input$file$datapath)
-    df_uploaded<- df
+    df_uploaded <- df
     output$sheet_contents <- renderDT({
-      datatable(df_uploaded,options = list(scrollX = TRUE))
+      datatable(df_uploaded, options = list(scrollX = TRUE))
     })
     
-    
-    required_columns<- schema_details()%>%
-      filter(isRequired == TRUE)%>%
+    required_columns <- schema_details() %>%
+      filter(isRequired == TRUE) %>%
       select(displayName)
-    required_columns<- as.character(required_columns$displaName)
+    required_columns <- as.character(required_columns$displayName)
     
-    if(!all(required_columns%in% colnames(df))){
+    if (!all(required_columns %in% colnames(df))) {
       showModal(modalDialog(
         title = "",
         paste("Data cannot be uploaded because required columns are missing. Please ensure that following columns are present:", 
@@ -586,17 +629,16 @@ server <- function(input, output, session) {
       ))
     }
     
-   
     # Automatically check columns when file is uploaded
     user_columns <- colnames(df)
     expected_columns <- schema_details()$displayName
     missing_columns <- setdiff(expected_columns, user_columns)
     matching_columns <- intersect(expected_columns, user_columns)
     
-    df<- df %>%
+    df <- df %>%
       select(all_of(matching_columns))
     
-    if(length(user_columns)> ncol(df)){
+    if (length(user_columns) > ncol(df)) {
       showModal(modalDialog(
         title = "Columns Mismatch",
         paste("There are columns in your uploaded file that are either missing or do not match the expected schema structure. Unmatched columns have been dropped. While you can still upload the columns that match, please ensure that it is the intended and correct file. Following columns were expected but not found in your uploaded file: ", 
@@ -607,86 +649,101 @@ server <- function(input, output, session) {
         )
       ))
     }
-   
+    
     status_data <- data.frame(
       Step = character(),
       Status = character(),
       Details = character(),
       stringsAsFactors = FALSE
     )
-   
+    
     if (length(missing_columns) == 0) {
       status_data <- rbind(status_data, data.frame(Step = "Column names check", Status = "Passed", Details = "All column names match the expected schema."))
     } else {
       missing_columns_text <- paste(missing_columns, collapse = ", ")
-      expected_columns_text <- paste(expected_columns, collapse = ", ")
-      status_data <- rbind(status_data, data.frame(Step = "Column names check", Status = "Failed, but matching columns can be uploaded", Details = paste("Missing columns:", missing_columns_text, ". Expected columns:", expected_columns_text)))
+      status_data <- rbind(status_data, data.frame(Step = "Column names check", Status = "Failed, but matching columns can be uploaded", Details = paste("Missing columns:", missing_columns_text)))
       shinyjs::hide("upload")
     }
-
     
-    if (all(required_columns%in% colnames(df))) {
+    if (all(required_columns %in% colnames(df))) {
       status_data <- rbind(status_data, data.frame(Step = "Required Columns check", Status = "Passed", Details = "All required columns are present."))
     } else {
-      missing_columns_text <- paste(required_columns, collapse = ", ")
-      expected_columns_text <- ""
       status_data <- rbind(status_data, data.frame(Step = "Required Columns check", Status = "Failed. Data cannot be uploaded", Details = paste("Required columns are:", required_columns)))
       shinyjs::hide("upload")
-    
     }
     
-      # Check for missing values
-      missing_values_check <- check_missing_values(df)
-      
-      if (is.null(missing_values_check)) {
-        status_data <- rbind(status_data, data.frame(Step = "Missing values check", Status = "Passed", Details = "No missing values found in the dataset."))
-      } else {
-
-        missing_values_details <- paste(missing_values_check$Column, collapse = ", ")
-        status_data <- rbind(status_data, data.frame(Step = "Missing values check", Status = "Failed, but present values can be uploaded", Details = paste("Columns with missing values:", missing_values_details)))
-      }
-      if (length(matching_columns) == 0 ) {
-        showModal(modalDialog(
-          title = "Schema Mismatch: Nothing to be uploaded!",
-          paste("None of the columns match the expected schema structure. The expected columns in the selected schema are:", 
-                paste(expected_columns, collapse = ", ")),
-          easyClose = TRUE,
-          footer = modalButton("Acknowledge and  reupload")
-        ))
-        # Stop further execution
-        req(FALSE)
-      }else{
-        
-        df<- remove_empty_columns(df, schema_details())
-        
-      
+    # Check for missing values
+    missing_values_check <- check_missing_values(df)
+    
+    if (is.null(missing_values_check)) {
+      status_data <- rbind(status_data, data.frame(Step = "Missing values check", Status = "Passed", Details = "No missing values found in the dataset."))
+    } else {
+      missing_values_details <- paste(missing_values_check$Column, collapse = ", ")
+      status_data <- rbind(status_data, data.frame(Step = "Missing values check", Status = "Failed, but present values can be uploaded", Details = paste("Columns with missing values:", missing_values_details)))
+    }
+    
+    if (length(matching_columns) == 0) {
+      showModal(modalDialog(
+        title = "Schema Mismatch: Nothing to be uploaded!",
+        paste("None of the columns match the expected schema structure. The expected columns in the selected schema are:", 
+              paste(expected_columns, collapse = ", ")),
+        easyClose = TRUE,
+        footer = modalButton("Acknowledge and reupload")
+      ))
+      req(FALSE)
+    } else {
+      df <- remove_empty_columns(df, schema_details())
       custom_entity_check <- check_custom_entity_links(df, benchcon, schema_details())
       
       if (all(sapply(custom_entity_check, length) == 0)) {
         status_data <- rbind(status_data, data.frame(Step = "Custom entity check", Status = "Passed", Details = "All custom entity links matched successfully."))
         shinyjs::show("upload")
-     
+        df_filtered<- df
       } else {
         unmatched <- custom_entity_check
         df_filtered <- remove_unmatched_rows(df, unmatched)
         
+        # Create a detailed message for the unmatched entities
+        unmatched_details <- lapply(names(unmatched), function(column_name) {
+          unmatched_values <- unmatched[[column_name]]
+          if (length(unmatched_values) > 0) {
+            paste0(column_name, ": ", paste(unmatched_values, collapse = ", "))
+          } else {
+            NULL
+          }
+        })
+        unmatched_details <- unmatched_details[!sapply(unmatched_details, is.null)]
+        unmatched_message <- paste(unmatched_details, collapse = "; ")
+        
         showModal(modalDialog(
           title = "Unmatched Custom Entity Links",
-          paste("Unmatched custom entity links were found. Rows containing those links have been removed. Please review the data that passed QC before proceeding or fix the links and upload a new file. Unmatched entities: ", paste(unlist(unmatched), collapse = ", ")),
+          paste("Unmatched custom entity links were found. Rows containing those links have been removed. Please review the data that passed QC before proceeding or fix the links and upload a new file. Unmatched entities: ", unmatched_message),
           footer = modalButton("OK")
         ))
         
-        status_data <- rbind(status_data, data.frame(Step = "Custom entity check", Status = "Failed, rows containing unmatched entites were removed", Details = "Unmatched custom entity links have been removed. Please review the filtered data and either reupload an updated file or proceed with the table."))
-        
-        shinyjs::show("upload")
-        
-        print(df_filtered)
-        
-        output$qc_contents <- renderDT({
-          datatable(df_filtered,options = list(scrollX = TRUE))
-        })
-        
+        status_data <- rbind(status_data, data.frame(Step = "Custom entity check", Status = "Failed, rows containing unmatched entities were removed", 
+                                                     Details = paste("Unmatched custom entity links have been removed. Please review the filtered data and either reupload an updated file or proceed with the table. Unmatched entities:", unmatched_message)
+        )
+        )
       }
+      
+      shinyjs::show("upload")
+      
+      output$qc_contents <- renderDT({
+        datatable(df_filtered, options = list(scrollX = TRUE))
+      })
+      
+      status_data <- rbind(status_data, data.frame(Step = "QC Summary", Status = "", Details = paste("Rows uploaded = ", 
+                                                                                                     nrow(df_uploaded), 
+                                                                                                     ". Columns uploaded = ",
+                                                                                                     ncol(df_uploaded),
+                                                                                                     ". Rows passed QC = ", nrow(df_filtered),
+                                                                                                     ". Columns passed QC = ", ncol(df_filtered),
+                                                                                                     ". Columns removed = ", paste(setdiff(colnames(df_uploaded), colnames(df_filtered)), collapse = ", ")
+      )
+      )
+      )
+    }
     
     output$status_table <- renderDT({
       datatable(status_data, options = list(dom = 't', pageLength = nrow(status_data)))
@@ -698,9 +755,12 @@ server <- function(input, output, session) {
     output$notebook_select <- renderUI({
       selectInput("notebook", "Select Notebook entry", choices = setNames(available_entries$id, available_entries$name), selected = NULL)
     })
-      }
   })
   
+
+
+
+
  
   selected_entry_url <- reactive({
     req(input$entry)

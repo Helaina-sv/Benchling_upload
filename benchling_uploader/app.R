@@ -369,13 +369,15 @@ send_request <- function(endpoint_url, secret_key, json_payload) {
 # Function to get task status
 get_task_status <- function(taskid, api_key) {
   url <- "https://helaina.benchling.com/api/v2/tasks"
-  response <- GET(url = paste0(url, "/", taskid), add_headers(.headers = c("accept" = "application/json")), authenticate(api_key, ""))
+  response <- GET(url = paste0(url, "/", taskid), 
+                  add_headers(.headers = c("accept" = "application/json")), 
+                  authenticate(api_key, ""))
   response_data <- content(response, "parsed")
   
   if (!is.null(response_data$message)) {
-    error_details <- if (!is.null(response_data$error)) {
+    error_messages <- if (!is.null(response_data$error)) {
       # Extract error messages and format them into a dataframe
-      error_messages <- do.call(rbind, lapply(response_data$error, function(e) {
+      do.call(rbind, lapply(response_data$error, function(e) {
         data.frame(Index = e$index, Message = e$message, stringsAsFactors = FALSE)
       }))
     } else {
@@ -389,6 +391,7 @@ get_task_status <- function(taskid, api_key) {
   
   return(result)
 }
+
 ##Logic to get project ID and notebook entries and then table IDs from it
 
 

@@ -427,16 +427,36 @@ ui <- fluidPage(
       
       fluidRow(
         column(
-          width = 8,  # Adjust as needed
+          width = 12,  # Adjust as needed
           uiOutput("file_uploader")
+        )
+       
+      ),
+      fluidRow(
+        column(
+          width = 8,
+          uiOutput("tab_selector")
         ),
         column(
           width = 4,  # Adjust as needed
           div(style = "margin-top: 25px;", uiOutput("run_qc"))  # Adjust margin as needed
         )
       ),
+      fluidRow(
+        column(12, 
+               div(
+                 style = "text-align: center;", 
+                 tags$a(
+                   id = "upload", 
+                   href = "#", 
+                   class = "btn btn-primary",
+                   style = "display: none;",  # Initially hidden
+                   "Upload to Benchling"
+                 )
+               )
+        )
+      ),
 
-         actionButton("upload", "Upload to Benchling", style = "display:none;"),
      
       uiOutput("task_ui")
     ),
@@ -549,6 +569,17 @@ server <- function(input, output, session) {
     })
   })
   
+  observeEvent(input$file, {
+    req(input$file)
+    
+    # Get sheet names from the uploaded file
+    sheets <- excel_sheets(input$file$datapath)
+    
+    # Update the UI for tab selection
+    output$tab_selector <- renderUI({
+      selectInput("selected_tab", "Choose Tab:", choices = sheets)
+    })
+  })
   observeEvent(input$schema, {
     output$download_template <- renderUI({
       if (!is.null(input$schema)) {
@@ -617,12 +648,16 @@ server <- function(input, output, session) {
     }
   })
   
+  data <- reactive({
+    req(input$file, input$selected_tab)
+    read_excel(input$file$datapath, sheet = input$selected_tab)
+  })
   
  
   ##QC function
   observeEvent(input$qc, {
     req(input$file)
-    df <- read_excel(input$file$datapath)
+    df <- data()
     df_uploaded <- df
     output$sheet_contents <- renderDT({
       datatable(df_uploaded, options = list(scrollX = TRUE))
@@ -815,7 +850,7 @@ server <- function(input, output, session) {
     req(input$project)
     req(input$schema)
     
-    df <- read_excel(input$file$datapath)
+    df <- data()
     
     schemaID <- input$schema
     projectID <- input$project

@@ -22,12 +22,21 @@ create_dummy_data<- function(){
   all_entries<- dbGetQuery(benchcon, "SELECT * FROM entry")
   all_tables<- dbGetQuery(benchcon, "SELECT * FROM information_schema.tables WHERE table_type = 'BASE TABLE'")
   schema_details<- fetch_schema_details("assaysch_k6vDZiRO")
-  df<- read_excel("~/Desktop/HTS USP Sampling ID Results 1.xlsx")
+  df<- read_excel("~/Desktop/HTS USP TEST.xlsx")
   df<- remove_empty_columns(df, schema_details)
   
-  #box<- dbGetQuery(benchcon, "SELECT * FROM 	container$raw")
+  box<- dbGetQuery(benchcon, "SELECT * FROM well_qpix_re_array_source$raw")
+  container<- dbGetQuery(benchcon, "SELECT * FROM container$raw")
   
-  #hts<- dbGetQuery(benchcon, "SELECT * FROM hts_usp_sampling_id_results$raw LIMIT 5000")
+  
+  hts <- dbGetQuery(benchcon, "
+  SELECT * 
+  FROM hts_usp_sampling_id_results$raw
+  WHERE cell_source_unique_id_inventory IS NOT NULL
+  ORDER BY \"modified_at$\" DESC
+  LIMIT 500
+")
+  
   
   }
 
@@ -469,9 +478,6 @@ server <- function(input, output, session) {
     output$schema_ui <- renderUI(NULL)
     output$file_uploader <- renderUI(NULL)
     output$run_qc <- renderUI(NULL)
-    output$download_button<- renderUI(NULL)
-    output$download_template <- renderUI(NULL)
-    # Hide the upload button
     shinyjs::hide("upload")
     
     # Clear the data table
@@ -489,8 +495,8 @@ server <- function(input, output, session) {
     output$file_uploader <- renderUI(NULL)
     output$run_qc <- renderUI(NULL)
     output$schema_ui <- renderUI(NULL)
-    output$download_button<- renderUI(NULL)
-    output$download_template <- renderUI(NULL)
+   # output$download_button<- renderUI(NULL)
+    #output$download_template <- renderUI(NULL)
     
     # Hide the upload button
     shinyjs::hide("upload")
@@ -507,11 +513,9 @@ server <- function(input, output, session) {
   observeEvent(input$schema, {
     # Reset UI elements when a new project is selected
     output$run_qc <- renderUI(NULL)
-    output$download_button<- renderUI(NULL)
-    # Hide the upload button
+ 
     shinyjs::hide("upload")
-    output$download_template <- renderUI(NULL)
-    
+
     # Clear the data table
     output$status_table <- DT::renderDataTable(NULL)
     output$sheet_contents <- DT::renderDataTable(NULL)
@@ -544,21 +548,31 @@ server <- function(input, output, session) {
   
   observeEvent(input$schema, {
     output$download_template <- renderUI({
-      if (!is.null(input$schema) && input$schema != "") {
-        downloadButton("download_button", "Download Schema Template")
+      if (!is.null(input$schema)) {
+        downloadButton("download_schema_template", "Download Schema Template")
       } else {
-        "No schema selected"
+        NULL  # Return NULL if no schema is selected
       }
     })
   })
   
-  output$download_button <- downloadHandler(
+  schema_details <- reactive({
+    req(input$schema)  
+    selected_schema_id <- input$schema
+    fetch_schema_details(selected_schema_id)
+  })
+
+  
+  output$download_schema_template <- downloadHandler(
     filename = function() {
-      paste("schema_template.xlsx")
+      "schema_template.xlsx"
     },
     content = function(file) {
-      # Assuming schema_details is a function returning a dataframe
-      details <- schema_details()
+      details <- schema_details()  # Call the reactive expression
+      
+      # Debug statement
+      cat("Preparing schema template for download\n")
+      print(details)
       
       # Create a new workbook
       wb <- createWorkbook()
@@ -572,8 +586,12 @@ server <- function(input, output, session) {
       
       # Save the workbook to the specified file
       saveWorkbook(wb, file, overwrite = TRUE)
+      
+      # Debug statement
+      cat("Schema template downloaded successfully\n")
     }
   )
+
   
   observeEvent(input$showschemas, {
     req(input$entry)
@@ -596,11 +614,7 @@ server <- function(input, output, session) {
     }
   })
   
-  schema_details <- reactive({
-    req(input$schema)  
-    selected_schema_id <- input$schema
-    fetch_schema_details(selected_schema_id)
-  })
+  
  
   ##QC function
   observeEvent(input$qc, {
@@ -829,11 +843,13 @@ server <- function(input, output, session) {
     df_filtered_converted <- convert_custom_entity_links(df_filtered, schema_details())
     df_filtered_converted <- as.data.frame(df_filtered_converted)
     # Split the dataframe into chunks of 499 rows
-    chunks <- split_into_chunks(df_filtered_converted, 499)
+    chunks <- split_into_chunks(df_filtered_converted, 500)
     if (length(chunks) > length(tableID)) {
       showModal(modalDialog(
         title = "Insufficient Tables",
-        paste("Please use the link to the notebook entry and insert", length(chunks) - length(tableID), "more result schema(s).")
+        paste("The data you are uploading has",nrow(df_filtered_converted ),"rows and will not fit in the available tables \n",
+              "Please use the link to the notebook entry and insert", length(chunks) - length(tableID), 
+              "more result schema(s).")
       ))
     } else {
       showModal(modalDialog(

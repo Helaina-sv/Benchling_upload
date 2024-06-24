@@ -2,6 +2,7 @@ library(shiny)
 library(httr)
 library(jsonlite)
 library(lubridate)
+library(plyr)
 library(dplyr)
 library(dbplyr)
 library(dotenv)
@@ -10,7 +11,7 @@ library(DBI)
 library(readxl)
 library(shinyjs)
 library(DT)
-library(plyr)
+
 library(openxlsx)
 
 create_dummy_data<- function(){
@@ -321,7 +322,10 @@ convert_custom_entity_links <- function(df, schema_details) {
           return(NA)
         }
         match_value <- index$id[match(x, index$name)]
-        if (is.na(match_value)) return(NA) else return(match_value)
+        if (is.na(match_value)) 
+          return(NA) 
+        else 
+          return(match_value)
       })
     }
   }
@@ -444,18 +448,12 @@ ui <- fluidPage(
       ),
       fluidRow(
         column(12, 
-               div(
-                 style = "text-align: center;", 
-                 tags$a(
-                   id = "upload", 
-                   href = "#", 
-                   class = "btn btn-primary",
-                   style = "display: none;",  # Initially hidden
-                   "Upload to Benchling"
-                 )
+               div(style = "text-align: center;", 
+                   actionButton("upload", "Upload to Benchling", class = "btn btn-primary", style = "display: none;")
                )
         )
-      ),
+      )
+      ,
 
      
       uiOutput("task_ui")
@@ -553,7 +551,13 @@ server <- function(input, output, session) {
     all_entries <- dbGetQuery(benchcon, query)
     
     output$entry_ui <- renderUI({
-      selectInput("entry", "Select Notebook Entry:", choices = setNames(all_entries$id, all_entries$name), selected = NA)
+      selectizeInput(
+        "entry",
+        "Select Notebook Entry:",
+        choices = setNames(all_entries$id, all_entries$name),
+        selected = NA,
+        options = list(placeholder = 'Type to search...', create = FALSE)
+      )
     })
   })
   observeEvent(input$entry, {
@@ -638,6 +642,9 @@ server <- function(input, output, session) {
     
     # Execute the SQL query
     all_schema <- dbGetQuery(benchcon, sql_query)
+    output$notebook_select <- renderUI({
+      selectInput("notebook", "Select Notebook entry", choices = setNames(available_entries$id, available_entries$name), selected = NULL)
+    })
     
     output$schema_ui <- renderUI({
       selectInput("schema", 
@@ -689,7 +696,7 @@ server <- function(input, output, session) {
     df <- df %>%
       select(all_of(matching_columns))
     
-    if (length(user_columns) > ncol(df)) {
+    if (length(user_columns) != ncol(df)) {
       showModal(modalDialog(
         title = "Columns Mismatch",
         paste("There are columns in your uploaded file that are either missing or do not match the expected schema structure. Unmatched columns have been dropped. While you can still upload the columns that match, please ensure that it is the intended and correct file. Following columns were expected but not found in your uploaded file: ", 
@@ -713,7 +720,7 @@ server <- function(input, output, session) {
     } else {
       missing_columns_text <- paste(missing_columns, collapse = ", ")
       status_data <- rbind(status_data, data.frame(Step = "Column names check", Status = "Failed, but matching columns can be uploaded", Details = paste("Missing columns:", missing_columns_text)))
-      shinyjs::hide("upload")
+      shinyjs::show("upload")
     }
     
     if (all(required_columns %in% colnames(df))) {
@@ -803,9 +810,7 @@ server <- function(input, output, session) {
     response <- get_response(url = "https://helaina.benchling.com/api/v2/entries", query_params = list(projectId = input$project, pageSize = 50), secret_key = api_key)
     available_entries <<- parse_response(response)$entries[, c("id", "name")]
     
-    output$notebook_select <- renderUI({
-      selectInput("notebook", "Select Notebook entry", choices = setNames(available_entries$id, available_entries$name), selected = NULL)
-    })
+   
   })
   
 
@@ -851,6 +856,7 @@ server <- function(input, output, session) {
     req(input$schema)
     
     df <- data()
+    cat("Upload button clicked.\n")
     
     schemaID <- input$schema
     projectID <- input$project

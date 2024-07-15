@@ -894,7 +894,7 @@ server <- function(input, output, session) {
     df_filtered_converted <- convert_custom_entity_links(df_filtered, schema_details())
     df_filtered_converted <- as.data.frame(df_filtered_converted)
     # Split the dataframe into chunks of 499 rows
-    chunks <- split_into_chunks(df_filtered_converted, 500)
+    chunks <- split_into_chunks(df_filtered_converted, 490)
     if (length(chunks) > length(tableID)) {
       showModal(modalDialog(
         title = "Insufficient Tables",

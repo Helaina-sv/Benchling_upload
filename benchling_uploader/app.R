@@ -39,7 +39,7 @@ create_dummy_data<- function(){
 ")
   
   
-  }
+}
 
 load_dot_env(".env")
 
@@ -61,14 +61,14 @@ colnames(all_projects)<- c("source_id", "project_name")
 all_projects<- all_projects %>%
   filter(project_name %in% c("Early-Stage R&D Team",
                              "Late Stage R&D",
-                            # "Nutritional Biology and Safety",
+                             # "Nutritional Biology and Safety",
                              "Bioinformatics",
                              "Analytical Chemistry",
                              "Protein Characterization from External Partners"))
 
 get_entries <- function(projectid) {
   query <- paste0("SELECT id, name FROM entry$raw WHERE source_id LIKE '", projectid, "'")
-    all_entries <- dbGetQuery(benchcon, query)
+  all_entries <- dbGetQuery(benchcon, query)
   
   return(all_entries)
 }
@@ -176,15 +176,23 @@ create_json_payload <- function(df, schema_id, project_id, table_id, schema_deta
   schema_details <- schema_details %>%
     filter(displayName %in% colnames(df))
   
-  # Extract the display names and internal names from the schema_details dataframe
+  # Extract the display names, internal names, and types from the schema_details dataframe
   display_names <- schema_details$displayName
   internal_names <- schema_details$name
+  types <- schema_details$type
+  
+  # Identify columns that should be treated as text
+  text_columns <- internal_names[types == "text"]
   
   # Function to create a single record payload
-  create_record_payload <- function(row, display_names, internal_names) {
+  create_record_payload <- function(row, display_names, internal_names, text_columns) {
     fields <- setNames(lapply(seq_along(display_names), function(i) {
       value <- row[[display_names[i]]]
       if (!is.na(value)) {
+        # Convert to character if the field is in the text_columns
+        if (internal_names[i] %in% text_columns) {
+          value <- as.character(value)
+        }
         return(list(value = value))
       } else {
         return(NULL)
@@ -199,7 +207,7 @@ create_json_payload <- function(df, schema_id, project_id, table_id, schema_deta
   
   # Create the list of assay results
   assay_results <- lapply(1:nrow(df), function(i) {
-    create_record_payload(df[i, ], display_names, internal_names)
+    create_record_payload(df[i, ], display_names, internal_names, text_columns)
   })
   
   # Ensure the payload has the correct structure
@@ -209,7 +217,6 @@ create_json_payload <- function(df, schema_id, project_id, table_id, schema_deta
   json_payload <- toJSON(payload, auto_unbox = TRUE, pretty = TRUE)
   return(json_payload)
 }
-
 remove_empty_columns<- function(df, schema_details){
   required<- schema_details %>% 
     filter(isRequired == FALSE)%>%
@@ -229,14 +236,14 @@ create_dropdown_index<- function(df, schema_details){
     filter(displayName %in% colnames(df))%>%
     filter(type %in% c("dropdown")) %>%
     select(name, displayName, type)
-    query <- paste0("'", paste(dropdown_links$displayName, collapse = "','"), "'")
-    sql_query <- paste("SELECT id FROM dropdown WHERE name IN (", query, ")")
-    dropdown_id <- dbGetQuery(benchcon, sql_query)
-    
-    query <- paste0("'", paste(dropdown_id, collapse = "','"), "'")
-    sql_query <- paste("SELECT id, name FROM dropdown_option$raw WHERE dropdown_id IN (", query, ")")
-    dropdown_id <- dbGetQuery(benchcon, sql_query)
-
+  query <- paste0("'", paste(dropdown_links$displayName, collapse = "','"), "'")
+  sql_query <- paste("SELECT id FROM dropdown WHERE name IN (", query, ")")
+  dropdown_id <- dbGetQuery(benchcon, sql_query)
+  
+  query <- paste0("'", paste(dropdown_id, collapse = "','"), "'")
+  sql_query <- paste("SELECT id, name FROM dropdown_option$raw WHERE dropdown_id IN (", query, ")")
+  dropdown_id <- dbGetQuery(benchcon, sql_query)
+  
   return(dropdown_id)
 }
 # Function to check custom entity links
@@ -281,7 +288,7 @@ check_custom_entity_links <- function(df, benchcon, schema_details) {
 # Function to convert custom entity links to internal IDs
 convert_custom_entity_links <- function(df, schema_details) {
   
-
+  
   # Get the entity links details from the schema and filter for existing columns
   entity_links <- schema_details %>%
     filter(displayName %in% colnames(df)) %>%
@@ -434,7 +441,7 @@ ui <- fluidPage(
           width = 12,  # Adjust as needed
           uiOutput("file_uploader")
         )
-       
+        
       ),
       fluidRow(
         column(
@@ -454,14 +461,14 @@ ui <- fluidPage(
         )
       )
       ,
-
-     
+      
+      
       uiOutput("task_ui")
     ),
     mainPanel(
       wellPanel(
         h3("Quality check", style = "margin-top: 0;"),
-       
+        
         
         DTOutput("status_table")
       ),
@@ -516,7 +523,7 @@ server <- function(input, output, session) {
     output$file_uploader <- renderUI(NULL)
     output$run_qc <- renderUI(NULL)
     output$schema_ui <- renderUI(NULL)
-   # output$download_button<- renderUI(NULL)
+    # output$download_button<- renderUI(NULL)
     #output$download_template <- renderUI(NULL)
     
     # Hide the upload button
@@ -534,9 +541,9 @@ server <- function(input, output, session) {
   observeEvent(input$schema, {
     # Reset UI elements when a new project is selected
     output$run_qc <- renderUI(NULL)
- 
+    
     shinyjs::hide("upload")
-
+    
     # Clear the data table
     output$status_table <- DT::renderDataTable(NULL)
     output$sheet_contents <- DT::renderDataTable(NULL)
@@ -599,7 +606,7 @@ server <- function(input, output, session) {
     selected_schema_id <- input$schema
     fetch_schema_details(selected_schema_id)
   })
-
+  
   
   output$download_schema_template <- downloadHandler(
     filename = function() {
@@ -629,29 +636,29 @@ server <- function(input, output, session) {
       cat("Schema template downloaded successfully\n")
     }
   )
-
+  
   
   observeEvent(input$showschemas, {
     req(input$entry)
     schemas <- get_schema_id_from_entry(input$entry)
     if(!is.null(schemas)){
-    query <- paste0("'", paste(schemas, collapse = "','"), "'")
-    
-    # Construct the SQL query using the IN clause
-    sql_query <- paste0("SELECT id, name FROM schema WHERE id IN (", query, ")")
-    
-    # Execute the SQL query
-    all_schema <- dbGetQuery(benchcon, sql_query)
-    output$notebook_select <- renderUI({
-      selectInput("notebook", "Select Notebook entry", choices = setNames(available_entries$id, available_entries$name), selected = NULL)
-    })
-    
-    output$schema_ui <- renderUI({
-      selectInput("schema", 
-                  "Following schemas were found in the selected notebook entry. Please make a selection:", 
-                  choices = setNames(all_schema$id, all_schema$name), 
-                  selected = character(0))
-    })
+      query <- paste0("'", paste(schemas, collapse = "','"), "'")
+      
+      # Construct the SQL query using the IN clause
+      sql_query <- paste0("SELECT id, name FROM schema WHERE id IN (", query, ")")
+      
+      # Execute the SQL query
+      all_schema <- dbGetQuery(benchcon, sql_query)
+      output$notebook_select <- renderUI({
+        selectInput("notebook", "Select Notebook entry", choices = setNames(available_entries$id, available_entries$name), selected = NULL)
+      })
+      
+      output$schema_ui <- renderUI({
+        selectInput("schema", 
+                    "Following schemas were found in the selected notebook entry. Please make a selection:", 
+                    choices = setNames(all_schema$id, all_schema$name), 
+                    selected = character(0))
+      })
     }
   })
   
@@ -660,7 +667,7 @@ server <- function(input, output, session) {
     read_excel(input$file$datapath, sheet = input$selected_tab)
   })
   
- 
+  
   ##QC function
   observeEvent(input$qc, {
     req(input$file)
@@ -810,21 +817,21 @@ server <- function(input, output, session) {
     response <- get_response(url = "https://helaina.benchling.com/api/v2/entries", query_params = list(projectId = input$project, pageSize = 50), secret_key = api_key)
     available_entries <<- parse_response(response)$entries[, c("id", "name")]
     
-   
+    
   })
   
-
-
-
-
- 
+  
+  
+  
+  
+  
   selected_entry_url <- reactive({
     req(input$entry)
     entry_id <- input$entry
     dbGetQuery(benchcon, sprintf("SELECT url FROM entry WHERE id LIKE '%s'", entry_id))
   })
   
-
+  
   observe({
     url <- selected_entry_url()
     if (!is.null(url) && nrow(url) > 0) {
@@ -862,7 +869,7 @@ server <- function(input, output, session) {
     projectID <- input$project
     entryID <- input$entry
     tableID <- get_table_id(entryID, schemaID)
-   
+    
     required_columns<- schema_details()%>%
       filter(isRequired == TRUE)%>%
       select(displayName)
@@ -881,7 +888,7 @@ server <- function(input, output, session) {
     
     df<- remove_empty_columns(df, schema_details())
     unmatched <- check_custom_entity_links(df =  df,benchcon = benchcon,schema_details =  schema_details())
-
+    
     df_filtered <- remove_unmatched_rows(df = df, unmatched)
     
     df_filtered_converted <- convert_custom_entity_links(df_filtered, schema_details())
@@ -969,6 +976,3 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
-
-
-
